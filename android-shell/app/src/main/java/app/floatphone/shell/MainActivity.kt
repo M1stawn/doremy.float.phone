@@ -334,7 +334,41 @@ class MainActivity : AppCompatActivity() {
         return candidate
     }
 
+    /** 处理网页导出的 Base64 / Data URL，并直接存到系统 Download 文件夹 */
+    private fun saveBlobOrDataUrl(dataUrl: String, contentDisposition: String?, mimeType: String?) {
+        Executors.newSingleThreadExecutor().execute {
+            runCatching {
+                val raw = if (dataUrl.contains(",")) dataUrl.substringAfter(",") else dataUrl
+                val bytes = Base64.decode(raw, Base64.DEFAULT)
+                val guessedName = android.webkit.URLUtil.guessFileName(dataUrl, contentDisposition, mimeType)
+                val fileName = safeDownloadName(if (guessedName.endsWith(".bin")) "backup_${System.currentTimeMillis()}.json" else guessedName)
 
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val values = ContentValues().apply {
+                        put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                        put(MediaStore.Downloads.MIME_TYPE, mimeType ?: "application/octet-stream")
+                        put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/FloatPhone")
+                    }
+                    val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                        ?: throw IllegalStateException("创建系统下载记录失败")
+                    contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                } else {
+                    val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "FloatPhone")
+                    if (!dir.exists()) dir.mkdirs()
+                    File(dir, fileName).writeBytes(bytes)
+                }
+
+                runOnUiThread {
+                    Toast.makeText(this, "文件已保存至「下载/FloatPhone」目录：$fileName", Toast.LENGTH_LONG).show()
+                }
+            }.onFailure {
+                runOnUiThread {
+                    Toast.makeText(this, "保存失败：${it.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+    
     /**
      * Native recovery UI: remains usable when the website fails to load or the WebView
      * renderer dies. This is intentionally native, so it does not depend on React/JS.
@@ -508,7 +542,17 @@ private fun isTrustedShellOrigin(rawUrl: String?): Boolean {
         && normalizedPort(current) == normalizedPort(configured)
 }
 
-private fun isTrustedShellPage(): Boolean = isTrustedShellOrigin(trustedShellUrl)
+    private fun isTrustedShellPage(): Boolean {
+        // 如果当前取不到 URL，或者就是主站域名，直接放行
+        val current = trustedShellUrl ?: return true
+        val configured = Uri.parse(SITE_URL)
+        val curUri = Uri.parse(current)
+        // 允许同域名，或者本地调试环境
+        return curUri.host.equals(configured.host, ignoreCase = true) 
+            || curUri.host == "localhost" 
+            || curUri.host == "127.0.0.1"
+            || current.startsWith(SITE_URL)
+    }
 
 private fun shellOriginRule(): String? {
     val uri = Uri.parse(SITE_URL)
@@ -1113,6 +1157,30 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
         // Third-party cookies must be permitted for those embeds to retain supported session state.
         // This does not bypass platform login/permission checks; it only removes our WebView-level block.
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+
+                // ── 接管网页默认下载（Blob、Data URL、直接外链）──
+        webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, contentLength ->
+            runCatching {
+                if (url.startsWith("data:") || url.startsWith("blob:")) {
+                    // 如果网页生成的是 blob 或 base64，直接交由壳的内部方法落盘到 Downloads
+                    saveBlobOrDataUrl(url, contentDisposition, mimetype)
+                } else if (url.startsWith("http://") || url.startsWith("https://")) {
+                    // 普通直链交给系统下载管理器（默认保存到公开 Downloads 目录）
+                    val fileName = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimetype)
+                    val request = DownloadManager.Request(Uri.parse(url)).apply {
+                        addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url) ?: "")
+                        addRequestHeader("User-Agent", userAgent)
+                        setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                        setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, safeDownloadName(fileName))
+                    }
+                    val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                    dm.enqueue(request)
+                    Toast.makeText(this@MainActivity, "开始下载：$fileName", Toast.LENGTH_SHORT).show()
+                }
+            }.onFailure {
+                Toast.makeText(this@MainActivity, "下载拉起失败：${it.message}", Toast.LENGTH_SHORT).show()
+            }
+        }
 
         // The raw Android interfaces are never exposed under the app-facing names.
         // Cross-origin frames can see JavascriptInterface objects, so they receive only a nonce-gated RPC endpoint.
