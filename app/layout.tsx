@@ -35,6 +35,25 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="zh-CN">
+      <style dangerouslySetInnerHTML={{ __html: `
+  netlify-badge,
+  [data-netlify-deploy-id],
+  .netlify-badge,
+  #netlify-badge,
+  a[href*="netlify.com"],
+  iframe[src*="netlify"],
+  div[style*="z-index: 2147483647"] {
+    display: none !important;
+    visibility: hidden !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+    clip: rect(0, 0, 0, 0) !important;
+    height: 0 !important;
+    width: 0 !important;
+    position: absolute !important;
+    top: -9999px !important;
+  }
+` }} />
       <head>
         <link rel="manifest" href="/manifest.webmanifest" crossOrigin="use-credentials" />
         <meta name="theme-color" content="#f8f7f2" />
@@ -54,6 +73,18 @@ export default function RootLayout({
         <ChatReasoningVisibilityController />
         <GlobalNoticeHost />
         {children}
+        <script dangerouslySetInnerHTML={{ __html: `
+  (function() {
+    var observer = new MutationObserver(function(mutations) {
+      var badges = document.querySelectorAll('netlify-badge, [data-netlify-deploy-id], a[href*="netlify.com"], iframe[src*="netlify"]');
+      badges.forEach(function(el) {
+        var host = el.closest('div[style*="position: fixed"]') || el;
+        host.remove();
+      });
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  })();
+` }} />
       </body>
     </html>
   );
