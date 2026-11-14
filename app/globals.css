@@ -47,3 +47,21 @@
   --font-size-lg: 17px;  --font-size-xl: 20px;
   --font-size-2xl: 24px; --font-size-3xl: 30px;
 }
+
+/* 强制彻底抹杀 Netlify Badge */
+[data-netlify-deploy-id],
+.netlify-badge,
+#netlify-badge,
+a[href*="netlify.com"],
+div[style*="z-index: 2147483647"],
+iframe[src*="netlify"] {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  position: absolute !important;
+  top: -9999px !important;
+  left: -9999px !important;
+  width: 0 !important;
+  height: 0 !important;
+}
