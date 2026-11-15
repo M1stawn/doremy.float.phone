@@ -1205,6 +1205,7 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
                         .apply()
                 }
             }
+            
                 if (isTrustedShellOrigin(url)) {
                     trustedShellUrl = url
                     getSharedPreferences("float_startup_diagnostics", Context.MODE_PRIVATE)
