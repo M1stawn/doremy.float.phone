@@ -56,14 +56,14 @@ export default function RootLayout({
         {children}
 <script dangerouslySetInnerHTML={{ __html: `
   (function() {
-    // 1. 拦截 attachShadow：只要 Netlify 徽章试图创建 Shadow DOM 黑盒，当场废掉它的宿主元素
+    // 1. 拦截 Shadow DOM：只有里面真的写了 netlify 才动手，绝不误伤正常组件
     var origAttach = Element.prototype.attachShadow;
     Element.prototype.attachShadow = function(init) {
       var shadow = origAttach.call(this, { mode: 'open' });
       var host = this;
       setTimeout(function() {
         var html = (shadow.innerHTML || '') + (host.outerHTML || '');
-        if (/netlify/i.test(html)) {
+        if (/netlify\\.com|powered by netlify|deployed on netlify/i.test(html)) {
           host.style.setProperty('display', 'none', 'important');
           host.remove();
         }
@@ -71,36 +71,35 @@ export default function RootLayout({
       return shadow;
     };
 
-    // 2. 扫描页面上所有非小手机本体（非 #__next）的顶层节点与悬浮元素
-    function killPoweredByBadge() {
-      // 小手机的所有正常界面全在 body 下的主容器里，凡是额外挂在 body 下的 Netlify 节点一律干掉
-      document.querySelectorAll('body > *').forEach(function(el) {
-        if (el.id === '__next' || el.tagName === 'SCRIPT' || el.tagName === 'STYLE') return;
-        var content = (el.outerHTML || '') + (el.innerText || '') + (el.shadowRoot ? el.shadowRoot.innerHTML : '');
-        var style = window.getComputedStyle(el);
-        // 只要包含 netlify 字样，或者是固定在屏幕角落的高层级悬浮块
-        if (/netlify/i.test(content) || (style.position === 'fixed' && parseInt(style.zIndex || '0', 10) > 99999)) {
+    // 2. 精准点杀：只删包含 netlify 特征的节点，彻底放行小手机自己的弹窗与浮窗
+    function killOnlyNetlify() {
+      // 直接抓带 netlify 属性、标签或外链的元素
+      document.querySelectorAll(
+        'netlify-badge, [data-netlify-deploy-id], .netlify-badge, #netlify-badge, a[href*="netlify.com"], iframe[src*="netlify"]'
+      ).forEach(function(el) {
+        // 只往上找一层固定定位的小外框，绝不往上删到主页面容器
+        var wrapper = el.closest('[data-netlify-deploy-id], netlify-badge') || el.parentElement;
+        if (wrapper && wrapper !== document.body && wrapper.children.length <= 2 && /netlify/i.test(wrapper.innerHTML)) {
+          wrapper.style.setProperty('display', 'none', 'important');
+          wrapper.remove();
+        } else {
           el.style.setProperty('display', 'none', 'important');
-          el.style.setProperty('visibility', 'hidden', 'important');
-          el.style.setProperty('opacity', '0', 'important');
-          el.style.setProperty('pointer-events', 'none', 'important');
           el.remove();
         }
       });
 
-      // 兜底：遍历页面上所有带链接或 ShadowRoot 的节点
-      document.querySelectorAll('a[href*="netlify"], [class*="netlify"], [id*="netlify"], iframe[src*="netlify"]').forEach(function(el) {
-        var box = el.closest('div[style*="fixed"]') || el.parentElement || el;
-        if (box && box !== document.body && box.id !== '__next') {
-          box.style.setProperty('display', 'none', 'important');
-          box.remove();
+      // 检查挂在 body 下带 open ShadowRoot 的野生宿主
+      document.querySelectorAll('body > *').forEach(function(el) {
+        if (el.shadowRoot && /netlify\\.com|powered by netlify/i.test(el.shadowRoot.innerHTML || '')) {
+          el.style.setProperty('display', 'none', 'important');
+          el.remove();
         }
       });
     }
 
-    killPoweredByBadge();
-    new MutationObserver(killPoweredByBadge).observe(document.documentElement, { childList: true, subtree: true });
-    setInterval(killPoweredByBadge, 300);
+    killOnlyNetlify();
+    new MutationObserver(killOnlyNetlify).observe(document.documentElement, { childList: true, subtree: true });
+    setInterval(killOnlyNetlify, 500);
   })();
 ` }} />
       </body>
