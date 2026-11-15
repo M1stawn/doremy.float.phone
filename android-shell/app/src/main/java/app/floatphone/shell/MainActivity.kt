@@ -1195,8 +1195,6 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
 
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
-                            override fun onPageFinished(view: WebView, url: String?) {
-                super.onPageFinished(view, url)
                 syncSystemNightMode()
                 if (isTrustedShellOrigin(url)) {
                     trustedShellUrl = url
