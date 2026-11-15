@@ -60,21 +60,32 @@ iframe[src*="netlify"] {
   pointer-events: none !important;
 }
 
-/* 2. 消除从子 App 退回桌面时的白屏闪烁与半透明白雾过渡 */
+/* 方案 B：消除白底，改为轻快的中心微缩过渡 */
+@keyframes floatAppQuickClose {
+  0% {
+    opacity: 1;
+    transform: scale(1) translateZ(0);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(0.92) translateZ(0);
+  }
+}
+
+::view-transition-old(root) {
+  animation: floatAppQuickClose 0.14s cubic-bezier(0.32, 0.72, 0, 1) forwards !important;
+}
+
+::view-transition-new(root) {
+  animation: none !important;
+}
+
 html,
 body,
 .phone-shell,
 .phone-screen,
-.app-window,
-.app-container,
-.app-view,
-[class*="app-transition"],
-[class*="screen-transition"] {
+[class*="app-window"],
+[class*="app-transition"] {
   background-color: transparent !important;
-}
-
-::view-transition-old(root),
-::view-transition-new(root) {
-  animation-duration: 0.12s !important;
-  mix-blend-mode: normal !important;
+  backface-visibility: hidden;
 }
