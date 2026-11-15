@@ -334,41 +334,7 @@ class MainActivity : AppCompatActivity() {
         return candidate
     }
 
-    /** 处理网页导出的 Base64 / Data URL，并直接存到系统 Download 文件夹 */
-    private fun saveBlobOrDataUrl(dataUrl: String, contentDisposition: String?, mimeType: String?) {
-        Executors.newSingleThreadExecutor().execute {
-            runCatching {
-                val raw = if (dataUrl.contains(",")) dataUrl.substringAfter(",") else dataUrl
-                val bytes = Base64.decode(raw, Base64.DEFAULT)
-                val guessedName = android.webkit.URLUtil.guessFileName(dataUrl, contentDisposition, mimeType)
-                val fileName = safeDownloadName(if (guessedName.endsWith(".bin")) "backup_${System.currentTimeMillis()}.json" else guessedName)
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val values = ContentValues().apply {
-                        put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-                        put(MediaStore.Downloads.MIME_TYPE, mimeType ?: "application/octet-stream")
-                        put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/FloatPhone")
-                    }
-                    val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                        ?: throw IllegalStateException("创建系统下载记录失败")
-                    contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-                } else {
-                    val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "FloatPhone")
-                    if (!dir.exists()) dir.mkdirs()
-                    File(dir, fileName).writeBytes(bytes)
-                }
-
-                runOnUiThread {
-                    Toast.makeText(this, "文件已保存至「下载/FloatPhone」目录：$fileName", Toast.LENGTH_LONG).show()
-                }
-            }.onFailure {
-                runOnUiThread {
-                    Toast.makeText(this, "保存失败：${it.message}", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-    }
-    
     /**
      * Native recovery UI: remains usable when the website fails to load or the WebView
      * renderer dies. This is intentionally native, so it does not depend on React/JS.
@@ -542,17 +508,7 @@ private fun isTrustedShellOrigin(rawUrl: String?): Boolean {
         && normalizedPort(current) == normalizedPort(configured)
 }
 
-    private fun isTrustedShellPage(): Boolean {
-        // 如果当前取不到 URL，或者就是主站域名，直接放行
-        val current = trustedShellUrl ?: return true
-        val configured = Uri.parse(SITE_URL)
-        val curUri = Uri.parse(current)
-        // 允许同域名，或者本地调试环境
-        return curUri.host.equals(configured.host, ignoreCase = true) 
-            || curUri.host == "localhost" 
-            || curUri.host == "127.0.0.1"
-            || current.startsWith(SITE_URL)
-    }
+private fun isTrustedShellPage(): Boolean = isTrustedShellOrigin(trustedShellUrl)
 
 private fun shellOriginRule(): String? {
     val uri = Uri.parse(SITE_URL)
@@ -1152,36 +1108,11 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
             allowFileAccess = false
             userAgentString = "$userAgentString FloatShell/$VERSION"
         }
-        syncSystemNightMode()
         CookieManager.getInstance().setAcceptCookie(true)
         // The app embeds cross-site video players (notably Bilibili's official iframe).
         // Third-party cookies must be permitted for those embeds to retain supported session state.
         // This does not bypass platform login/permission checks; it only removes our WebView-level block.
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
-
-        // ── 接管网页默认下载（Blob、Data URL、直接外链）──
-        webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, contentLength ->
-            runCatching {
-                if (url.startsWith("data:") || url.startsWith("blob:")) {
-                    // 如果网页生成的是 blob 或 base64，直接交由壳的内部方法落盘到 Downloads
-                    saveBlobOrDataUrl(url, contentDisposition, mimetype)
-                } else if (url.startsWith("http://") || url.startsWith("https://")) {
-                    // 普通直链交给系统下载管理器（默认保存到公开 Downloads 目录）
-                    val fileName = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimetype)
-                    val request = DownloadManager.Request(Uri.parse(url)).apply {
-                        addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url) ?: "")
-                        addRequestHeader("User-Agent", userAgent)
-                        setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                        setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, safeDownloadName(fileName))
-                    }
-                    val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-                    dm.enqueue(request)
-                    Toast.makeText(this@MainActivity, "开始下载：$fileName", Toast.LENGTH_SHORT).show()
-                }
-            }.onFailure {
-                Toast.makeText(this@MainActivity, "下载拉起失败：${it.message}", Toast.LENGTH_SHORT).show()
-            }
-        }
 
         // The raw Android interfaces are never exposed under the app-facing names.
         // Cross-origin frames can see JavascriptInterface objects, so they receive only a nonce-gated RPC endpoint.
@@ -1221,9 +1152,6 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
 
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
-                            override fun onPageFinished(view: WebView, url: String?) {
-                super.onPageFinished(view, url)
-                syncSystemNightMode()
                 if (isTrustedShellOrigin(url)) {
                     trustedShellUrl = url
                     getSharedPreferences("float_startup_diagnostics", Context.MODE_PRIVATE)
@@ -1276,75 +1204,9 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
                 }.getOrDefault(true)
             }
         }
-        webView.webViewClient = object : WebViewClient() {
-            override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
-                trustedShellUrl = url ?: trustedShellUrl
-                if (!secureBridgeDocumentStartInstalled && isTrustedShellPage()) {
-                    view.evaluateJavascript(secureBridgeBootstrapScript(), null)
-                }
-                recoveryOverlay?.let { rootContainer.removeView(it) }
-                recoveryOverlay = null
-            }
-
-            override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
-                super.doUpdateVisitedHistory(view, url, isReload)
-                if (isTrustedShellOrigin(url)) trustedShellUrl = url
-            }
-
-            override fun onPageFinished(view: WebView, url: String?) {
-                super.onPageFinished(view, url)
-                syncSystemNightMode()
-                if (isTrustedShellOrigin(url)) {
-                    trustedShellUrl = url
-                    getSharedPreferences("float_startup_diagnostics", Context.MODE_PRIVATE)
-                        .edit()
-                        .putBoolean("launch_in_progress", false)
-                        .putLong("last_successful_page_at", System.currentTimeMillis())
-                        .apply()
-                }
-            }
-
-            override fun onReceivedError(view: WebView, request: WebResourceRequest, error: android.webkit.WebResourceError) {
-                super.onReceivedError(view, request, error)
-                if (request.isForMainFrame) {
-                    val description = "网页主文档加载失败：${error.description}（错误码 ${error.errorCode}）"
-                    showNativeRecoveryScreen("网页没有加载成功", description)
-                }
-            }
-
-            override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: android.webkit.WebResourceResponse) {
-                super.onReceivedHttpError(view, request, response)
-                if (request.isForMainFrame && response.statusCode >= 400) {
-                    showNativeRecoveryScreen("站点返回错误", "HTTP ${response.statusCode} ${response.reasonPhrase ?: ""}\n地址：${request.url.host ?: "未知"}")
-                }
-            }
-
-            override fun onRenderProcessGone(view: WebView, detail: android.webkit.RenderProcessGoneDetail): Boolean {
-                val reason = if (detail.didCrash()) "WebView 渲染进程崩溃" else "WebView 渲染进程被系统回收"
-                val detailText = "$reason；系统优先级：${detail.rendererPriorityAtExit()}"
-                recordWebViewCrash(reason, detailText)
-                showNativeRecoveryScreen("网页进程异常退出", detailText)
-                return true
-            }
-
-            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                val url = request.url
-                if (!request.isForMainFrame) return false
-                trustedShellUrl = url.toString()
-                val scheme = url.scheme ?: return false
-                if (scheme == "http" || scheme == "https") {
-                    if (url.host == Uri.parse(SITE_URL).host) return false
-                    return runCatching {
-                        startActivity(Intent(Intent.ACTION_VIEW, url)); true
-                    }.getOrDefault(true)
-                }
-                return runCatching {
-                    startActivity(Intent(Intent.ACTION_VIEW, url)); true
-                }.getOrDefault(true)
-            }
-        }
 
         webView.webChromeClient = object : WebChromeClient() {
+            // Required by HTML5 video players inside cross-origin platform iframes.
             override fun onShowCustomView(view: View, callback: WebChromeClient.CustomViewCallback) {
                 if (webVideoCustomView != null) {
                     callback.onCustomViewHidden()
@@ -1367,6 +1229,7 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
                 hideWebVideoCustomView(notifyPage = false)
             }
 
+            // Capture WebView JavaScript warnings/errors locally for the diagnostics panel.
             override fun onConsoleMessage(consoleMessage: android.webkit.ConsoleMessage): Boolean {
                 val level = when (consoleMessage.messageLevel()) {
                     android.webkit.ConsoleMessage.MessageLevel.ERROR -> "ERROR"
@@ -1377,7 +1240,6 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
                     consoleMessage.lineNumber() + " " + consoleMessage.message().orEmpty())
                 return true
             }
-
             override fun onPermissionRequest(request: android.webkit.PermissionRequest) {
                 val supported = request.resources.filter { webResourcePermissions(it).isNotEmpty() }
                 if (supported.isEmpty()) { request.deny(); return }
@@ -1399,6 +1261,8 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
                 filePathCallback = callback
                 return runCatching {
                     val intent = params.createIntent()
+                    // createIntent() 一般已按 params.mode 带上 EXTRA_ALLOW_MULTIPLE；个别 WebView
+                    // 版本拿不到 multiple 模式，网页多选会退化成单选，这里显式兜一次。
                     if (params.mode == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE) {
                         intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
                     }
@@ -1409,27 +1273,27 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
             }
         }
 
-        // 接管网页默认下载（Blob、Data URL、直接外链）
-        webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
+        // 备份导出等下载：交给系统下载管理器，落到公共下载目录
+        webView.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             runCatching {
-                if (url.startsWith("data:") || url.startsWith("blob:")) {
-                    saveBlobOrDataUrl(url, contentDisposition, mimetype)
-                } else if (url.startsWith("http://") || url.startsWith("https://")) {
-                    val fileName = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimetype)
-                    val request = DownloadManager.Request(Uri.parse(url)).apply {
-                        addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url) ?: "")
-                        addRequestHeader("User-Agent", userAgent)
-                        setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                        setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, safeDownloadName(fileName))
-                    }
-                    val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-                    dm.enqueue(request)
-                    Toast.makeText(this@MainActivity, "开始下载：$fileName", Toast.LENGTH_SHORT).show()
+                if (url.startsWith("blob:") || url.startsWith("data:")) {
+                    // blob/data 由页面内 JS 触发的 a[download] 处理；提示用户等待
+                    Toast.makeText(this, "正在导出…", Toast.LENGTH_SHORT).show()
+                    return@DownloadListener
                 }
-            }.onFailure {
-                Toast.makeText(this@MainActivity, "下载拉起失败：${it.message}", Toast.LENGTH_SHORT).show()
+                val request = DownloadManager.Request(Uri.parse(url)).apply {
+                    addRequestHeader("User-Agent", userAgent)
+                    addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url) ?: "")
+                    setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                    setDestinationInExternalPublicDir(
+                        Environment.DIRECTORY_DOWNLOADS,
+                        safeDownloadName(android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType)),
+                    )
+                }
+                (getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
+                Toast.makeText(this, "已开始下载到「下载」目录", Toast.LENGTH_SHORT).show()
             }
-        }
+        })
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -1453,7 +1317,6 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
         ensurePushService()
     }
 
-            
     /** singleTask：App 已在运行时（如全屏来电页接听）通过 onNewIntent 送达深链 */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -1463,6 +1326,7 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
             showNativeRecoveryScreen("当前处于安全恢复模式", "收到站内跳转请求，但网页尚未启动。请先复制诊断摘要，确认后退出恢复模式重试。")
             return
         }
+        // SPA 已加载：loadUrl 到同页 hash 只触发 hashchange，不会整页重载
         webView.loadUrl(target)
     }
 
@@ -1528,42 +1392,6 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
         }
     }
 
-    /** 把手机系统的白天/黑夜模式同步给 WebView 与网页主题 */
-    private fun syncSystemNightMode() {
-        if (!::webView.isInitialized) return
-        val isNight = (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
-            android.content.res.Configuration.UI_MODE_NIGHT_YES
-
-        // 兼容 Android 原生 WebView 深色设置（用 runCatching 反射调用，彻底避开编译期版本报错）
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            runCatching {
-                webView.settings.forceDark = if (isNight) {
-                    android.webkit.WebSettings.FORCE_DARK_ON
-                } else {
-                    android.webkit.WebSettings.FORCE_DARK_OFF
-                }
-            }
-        }
-
-        // 给网页 <html> 挂上 dark 类名、data-theme 和 color-scheme，直接激活小手机的深色主题
-        val mode = if (isNight) "dark" else "light"
-        val js = """
-            (function() {
-                var root = document.documentElement;
-                root.classList.toggle('dark', $isNight);
-                root.setAttribute('data-theme', '$mode');
-                root.style.colorScheme = '$mode';
-                window.dispatchEvent(new CustomEvent('floatshell-themechange', { detail: '$mode' }));
-            })();
-        """.trimIndent()
-        webView.evaluateJavascript(js, null)
-    }
-
-    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
-        super.onConfigurationChanged(newConfig)
-        syncSystemNightMode()
-    }
-
     /**
      * 监听真实状态栏高度（物理像素，经 WindowInsets 实测，隐藏状态栏后依然能拿到原始尺寸）。
      * 不同机型/异形屏/系统字体缩放都会让这个值跟 CSS 的 env(safe-area-inset-top) 估算不一致，
@@ -1607,10 +1435,7 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         // 临时唤出状态栏后、或从锁屏/多任务回来时焦点变化，需要重新隐藏一次
-        if (hasFocus) {
-            hideSystemStatusBar()
-            syncSystemNightMode()
-        }
+        if (hasFocus) hideSystemStatusBar()
     }
 
     /**
