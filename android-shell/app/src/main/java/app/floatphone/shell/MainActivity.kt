@@ -316,7 +316,7 @@ class MainActivity : AppCompatActivity() {
      * 文件名安全化 + 避开重名。系统下载器遇到同名文件会直接失败（ERROR_FILE_ALREADY_EXISTS），
      * 所以这里先算一个「名字(1).ext」式的不冲突名称。
      */
-    private fun safeDownloadName(fileName: String): String {
+        private fun safeDownloadName(fileName: String): String {
         val cleaned = fileName
             .replace(Regex("[\\\\/:*?\"<>|]"), "_")
             .trim()
@@ -332,6 +332,43 @@ class MainActivity : AppCompatActivity() {
             index++
         }
         return candidate
+    }
+
+    /** 处理网页导出的 Base64 / Data URL，直接落盘到系统 Download/FloatPhone 目录 */
+    private fun saveBlobOrDataUrl(dataUrl: String, contentDisposition: String?, mimeType: String?) {
+        Executors.newSingleThreadExecutor().execute {
+            runCatching {
+                val raw = if (dataUrl.contains(",")) dataUrl.substringAfter(",") else dataUrl
+                val bytes = Base64.decode(raw, Base64.DEFAULT)
+                val guessedName = android.webkit.URLUtil.guessFileName(dataUrl, contentDisposition, mimeType)
+                val fileName = safeDownloadName(
+                    if (guessedName.endsWith(".bin")) "backup_${System.currentTimeMillis()}.json" else guessedName
+                )
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val values = ContentValues().apply {
+                        put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                        put(MediaStore.Downloads.MIME_TYPE, mimeType ?: "application/octet-stream")
+                        put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/FloatPhone")
+                    }
+                    val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                        ?: throw IllegalStateException("创建系统下载记录失败")
+                    contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                } else {
+                    val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "FloatPhone")
+                    if (!dir.exists()) dir.mkdirs()
+                    File(dir, fileName).writeBytes(bytes)
+                }
+
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "已保存至「下载/FloatPhone」：$fileName", Toast.LENGTH_LONG).show()
+                }
+            }.onFailure {
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "保存失败：${it.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
     }
 
 
