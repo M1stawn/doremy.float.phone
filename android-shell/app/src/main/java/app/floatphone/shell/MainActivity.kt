@@ -1195,6 +1195,18 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
 
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
+                            override fun onPageFinished(view: WebView, url: String?) {
+                super.onPageFinished(view, url)
+                syncSystemNightMode()
+                if (isTrustedShellOrigin(url)) {
+                    trustedShellUrl = url
+                    getSharedPreferences("float_startup_diagnostics", Context.MODE_PRIVATE)
+                        .edit()
+                        .putBoolean("launch_in_progress", false)
+                        .putLong("last_successful_page_at", System.currentTimeMillis())
+                        .apply()
+                }
+            }
                 if (isTrustedShellOrigin(url)) {
                     trustedShellUrl = url
                     getSharedPreferences("float_startup_diagnostics", Context.MODE_PRIVATE)
@@ -1316,28 +1328,50 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
             }
         }
 
-        // 备份导出等下载：交给系统下载管理器，落到公共下载目录
+        // 备份导出等下载：交给系统下载管理器，落到公共下载目录的 FloatPhone 文件夹
         webView.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             runCatching {
-                if (url.startsWith("blob:") || url.startsWith("data:")) {
-                    // blob/data 由页面内 JS 触发的 a[download] 处理；提示用户等待
-                    Toast.makeText(this, "正在导出…", Toast.LENGTH_SHORT).show()
+                if (url.startsWith("data:")) {
+                    saveBlobOrDataUrl(url, contentDisposition, mimeType)
                     return@DownloadListener
                 }
+                if (url.startsWith("blob:")) {
+                    // blob 链接如果走到这里，用 JS 把它转成 base64 再喂给 saveBlobOrDataUrl
+                    val js = """
+                        (function() {
+                            fetch('$url').then(r => r.blob()).then(b => {
+                                var reader = new FileReader();
+                                reader.onloadend = function() {
+                                    if (window.AndroidShell && window.AndroidShell.saveBase64File) {
+                                        var base64 = reader.result.split(',')[1] || '';
+                                        window.AndroidShell.saveBase64File(base64, 'backup_' + Date.now() + '.json', b.type || 'application/json');
+                                    }
+                                };
+                                reader.readAsDataURL(b);
+                            });
+                        })();
+                    """.trimIndent()
+                    webView.evaluateJavascript(js, null)
+                    Toast.makeText(this@MainActivity, "正在导出文件到下载目录…", Toast.LENGTH_SHORT).show()
+                    return@DownloadListener
+                }
+                val fileName = safeDownloadName(android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType))
                 val request = DownloadManager.Request(Uri.parse(url)).apply {
                     addRequestHeader("User-Agent", userAgent)
                     addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url) ?: "")
                     setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
                     setDestinationInExternalPublicDir(
                         Environment.DIRECTORY_DOWNLOADS,
-                        safeDownloadName(android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType)),
+                        "FloatPhone/$fileName",
                     )
                 }
                 (getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
-                Toast.makeText(this, "已开始下载到「下载」目录", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "已开始下载到「下载/FloatPhone」：$fileName", Toast.LENGTH_SHORT).show()
+            }.onFailure {
+                Toast.makeText(this@MainActivity, "下载失败：${it.message}", Toast.LENGTH_SHORT).show()
             }
         })
-
+        
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 if (webVideoCustomView != null) {
@@ -1435,6 +1469,41 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
         }
     }
 
+    /** 把手机系统的白天/黑夜模式同步给 WebView 与网页主题（纯标准 API，零第三方库依赖报错） */
+    private fun syncSystemNightMode() {
+        if (!::webView.isInitialized) return
+        val isNight = (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching {
+                @Suppress("DEPRECATION")
+                webView.settings.forceDark = if (isNight) {
+                    android.webkit.WebSettings.FORCE_DARK_ON
+                } else {
+                    android.webkit.WebSettings.FORCE_DARK_OFF
+                }
+            }
+        }
+
+        val mode = if (isNight) "dark" else "light"
+        val js = """
+            (function() {
+                var root = document.documentElement;
+                root.classList.toggle('dark', $isNight);
+                root.setAttribute('data-theme', '$mode');
+                root.style.colorScheme = '$mode';
+                window.dispatchEvent(new CustomEvent('floatshell-themechange', { detail: '$mode' }));
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        syncSystemNightMode()
+    }
+
     /**
      * 监听真实状态栏高度（物理像素，经 WindowInsets 实测，隐藏状态栏后依然能拿到原始尺寸）。
      * 不同机型/异形屏/系统字体缩放都会让这个值跟 CSS 的 env(safe-area-inset-top) 估算不一致，
@@ -1478,9 +1547,12 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         // 临时唤出状态栏后、或从锁屏/多任务回来时焦点变化，需要重新隐藏一次
-        if (hasFocus) hideSystemStatusBar()
+        if (hasFocus) {
+            hideSystemStatusBar()
+            syncSystemNightMode()
+        }
     }
-
+    
     /**
      * 点通知的落点。带 sessionId 时通过深链直达对应会话（复用 consumeOpenUrl 的
      * EXTRA_OPEN_URL 通道，来电接听走的就是它）；不带则回首页。
