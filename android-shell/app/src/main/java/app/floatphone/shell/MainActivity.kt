@@ -1206,16 +1206,6 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
                 }
             }
             
-                if (isTrustedShellOrigin(url)) {
-                    trustedShellUrl = url
-                    getSharedPreferences("float_startup_diagnostics", Context.MODE_PRIVATE)
-                        .edit()
-                        .putBoolean("launch_in_progress", false)
-                        .putLong("last_successful_page_at", System.currentTimeMillis())
-                        .apply()
-                }
-            }
-
             override fun onReceivedError(view: WebView, request: WebResourceRequest, error: android.webkit.WebResourceError) {
                 super.onReceivedError(view, request, error)
                 if (request.isForMainFrame) {
