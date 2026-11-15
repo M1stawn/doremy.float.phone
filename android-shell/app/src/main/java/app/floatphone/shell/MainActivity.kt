@@ -1077,6 +1077,9 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
+       androidx.appcompat.app.AppCompatDelegate.setDefaultNightMode(
+       androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
+   )
         super.onCreate(savedInstanceState)
         pruneCachedSharedVideos()
         installNativeCrashRecorder()
