@@ -1152,13 +1152,14 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
             allowFileAccess = false
             userAgentString = "$userAgentString FloatShell/$VERSION"
         }
+        syncSystemNightMode()
         CookieManager.getInstance().setAcceptCookie(true)
         // The app embeds cross-site video players (notably Bilibili's official iframe).
         // Third-party cookies must be permitted for those embeds to retain supported session state.
         // This does not bypass platform login/permission checks; it only removes our WebView-level block.
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
-                // ── 接管网页默认下载（Blob、Data URL、直接外链）──
+        // ── 接管网页默认下载（Blob、Data URL、直接外链）──
         webView.setDownloadListener { url, userAgent, contentDisposition, mimetype, contentLength ->
             runCatching {
                 if (url.startsWith("data:") || url.startsWith("blob:")) {
@@ -1220,6 +1221,9 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
 
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
+                            override fun onPageFinished(view: WebView, url: String?) {
+                super.onPageFinished(view, url)
+                syncSystemNightMode()
                 if (isTrustedShellOrigin(url)) {
                     trustedShellUrl = url
                     getSharedPreferences("float_startup_diagnostics", Context.MODE_PRIVATE)
@@ -1460,6 +1464,49 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
         }
     }
 
+    /** 把手机系统的白天/黑夜模式同步给 WebView 与网页主题 */
+    private fun syncSystemNightMode() {
+        if (!::webView.isInitialized) return
+        val isNight = (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+
+        // 1. 打开 WebView 底层的深色模式开关（让网页自带的 @media (prefers-color-scheme: dark) 生效）
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
+            WebViewCompat.setAlgorithmicDarkeningAllowed(webView.settings, isNight)
+        }
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK)) {
+            @Suppress("DEPRECATION")
+            androidx.webkit.WebSettingsCompat.setForceDark(
+                webView.settings,
+                if (isNight) androidx.webkit.WebSettingsCompat.FORCE_DARK_ON else androidx.webkit.WebSettingsCompat.FORCE_DARK_OFF
+            )
+        }
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK_STRATEGY)) {
+            @Suppress("DEPRECATION")
+            androidx.webkit.WebSettingsCompat.setForceDarkStrategy(
+                webView.settings,
+                androidx.webkit.WebSettingsCompat.DARK_STRATEGY_WEB_THEME_DARKENING_ONLY
+            )
+        }
+
+        // 2. 同时给网页 <html> 挂上 dark 类名和 data-theme 属性，兼容小手机里的各种深色主题
+        val mode = if (isNight) "dark" else "light"
+        val js = """
+            (function() {
+                var root = document.documentElement;
+                root.classList.toggle('dark', $isNight);
+                root.setAttribute('data-theme', '$mode');
+                root.style.colorScheme = '$mode';
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js, null)
+    }
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        syncSystemNightMode()
+    }
+
     /**
      * 监听真实状态栏高度（物理像素，经 WindowInsets 实测，隐藏状态栏后依然能拿到原始尺寸）。
      * 不同机型/异形屏/系统字体缩放都会让这个值跟 CSS 的 env(safe-area-inset-top) 估算不一致，
@@ -1503,7 +1550,10 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         // 临时唤出状态栏后、或从锁屏/多任务回来时焦点变化，需要重新隐藏一次
-        if (hasFocus) hideSystemStatusBar()
+        if (hasFocus) {
+            hideSystemStatusBar()
+            syncSystemNightMode()
+        }
     }
 
     /**
