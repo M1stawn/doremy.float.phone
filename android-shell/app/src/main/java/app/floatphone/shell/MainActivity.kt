@@ -545,7 +545,13 @@ private fun isTrustedShellOrigin(rawUrl: String?): Boolean {
         && normalizedPort(current) == normalizedPort(configured)
 }
 
-private fun isTrustedShellPage(): Boolean = isTrustedShellOrigin(trustedShellUrl)
+private fun isTrustedShellPage(): Boolean {
+    if (isTrustedShellOrigin(trustedShellUrl)) return true
+    val current = trustedShellUrl ?: return true
+    val curHost = Uri.parse(current).host ?: return true
+    val cfgHost = Uri.parse(SITE_URL).host ?: return true
+    return curHost.equals(cfgHost, ignoreCase = true) || curHost.endsWith(".netlify.app", ignoreCase = true)
+}
 
 private fun shellOriginRule(): String? {
     val uri = Uri.parse(SITE_URL)
