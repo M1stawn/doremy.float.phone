@@ -1276,7 +1276,6 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
                 }.getOrDefault(true)
             }
         }
-            
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                 trustedShellUrl = url ?: trustedShellUrl
@@ -1454,6 +1453,7 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
         ensurePushService()
     }
 
+            
     /** singleTask：App 已在运行时（如全屏来电页接听）通过 onNewIntent 送达深链 */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
