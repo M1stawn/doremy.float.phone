@@ -59,3 +59,22 @@ iframe[src*="netlify"] {
   opacity: 0 !important;
   pointer-events: none !important;
 }
+
+/* 2. 消除从子 App 退回桌面时的白屏闪烁与半透明白雾过渡 */
+html,
+body,
+.phone-shell,
+.phone-screen,
+.app-window,
+.app-container,
+.app-view,
+[class*="app-transition"],
+[class*="screen-transition"] {
+  background-color: transparent !important;
+}
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 0.12s !important;
+  mix-blend-mode: normal !important;
+}
