@@ -316,7 +316,7 @@ class MainActivity : AppCompatActivity() {
      * 文件名安全化 + 避开重名。系统下载器遇到同名文件会直接失败（ERROR_FILE_ALREADY_EXISTS），
      * 所以这里先算一个「名字(1).ext」式的不冲突名称。
      */
-        private fun safeDownloadName(fileName: String): String {
+    private fun safeDownloadName(fileName: String): String {
         val cleaned = fileName
             .replace(Regex("[\\\\/:*?\"<>|]"), "_")
             .trim()
@@ -334,7 +334,7 @@ class MainActivity : AppCompatActivity() {
         return candidate
     }
 
-    /** 处理网页导出的 Base64 / Data URL，直接落盘到系统 Download/FloatPhone 目录 */
+    /** 处理网页导出的 Base64 / Data URL，保存到系统 Download/FloatPhone 目录 */
     private fun saveBlobOrDataUrl(dataUrl: String, contentDisposition: String?, mimeType: String?) {
         Executors.newSingleThreadExecutor().execute {
             runCatching {
@@ -548,6 +548,7 @@ private fun isTrustedShellOrigin(rawUrl: String?): Boolean {
 private fun isTrustedShellPage(): Boolean {
     if (isTrustedShellOrigin(trustedShellUrl)) return true
     val current = trustedShellUrl ?: return true
+    if (current.startsWith("blob:") || current.startsWith("data:") || current.startsWith("about:")) return true
     val curHost = Uri.parse(current).host ?: return true
     val cfgHost = Uri.parse(SITE_URL).host ?: return true
     return curHost.equals(cfgHost, ignoreCase = true) || curHost.endsWith(".netlify.app", ignoreCase = true)
@@ -641,7 +642,7 @@ private fun fetchSharedVideoPage(startUrl: String): SharedVideoPage {
         }
 
         val requestBuilder = Request.Builder()
-            .url(current)
+        .url(current)
             .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36")
             .header("Accept", "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8")
         runCatching { CookieManager.getInstance().getCookie(current.toString()) }
@@ -1077,9 +1078,9 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
-       androidx.appcompat.app.AppCompatDelegate.setDefaultNightMode(
-       androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
-   )
+        androidx.appcompat.app.AppCompatDelegate.setDefaultNightMode(
+            androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
+        )
         super.onCreate(savedInstanceState)
         pruneCachedSharedVideos()
         installNativeCrashRecorder()
@@ -1155,7 +1156,7 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
             userAgentString = "$userAgentString FloatShell/$VERSION"
         }
         if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.ALGORITHMIC_DARKENING)) {
-            androidx.webkit.WebSettingsCompat.setAlgorithmicDarkeningAllowed(webView.settings, true)
+           androidx.webkit.WebSettingsCompat.setAlgorithmicDarkeningAllowed(webView.settings, true)
         }
         CookieManager.getInstance().setAcceptCookie(true)
         // The app embeds cross-site video players (notably Bilibili's official iframe).
@@ -1201,7 +1202,6 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
 
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
-                syncSystemNightMode()
                 if (isTrustedShellOrigin(url)) {
                     trustedShellUrl = url
                     getSharedPreferences("float_startup_diagnostics", Context.MODE_PRIVATE)
@@ -1211,7 +1211,7 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
                         .apply()
                 }
             }
-            
+
             override fun onReceivedError(view: WebView, request: WebResourceRequest, error: android.webkit.WebResourceError) {
                 super.onReceivedError(view, request, error)
                 if (request.isForMainFrame) {
@@ -1323,7 +1323,7 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
             }
         }
 
-        // 备份导出等下载：交给系统下载管理器，落到公共下载目录的 FloatPhone 文件夹
+        // 备份导出等下载：交给系统下载管理器，落到公共下载目录
         webView.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             runCatching {
                 if (url.startsWith("data:")) {
@@ -1331,23 +1331,7 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
                     return@DownloadListener
                 }
                 if (url.startsWith("blob:")) {
-                    // blob 链接如果走到这里，用 JS 把它转成 base64 再喂给 saveBlobOrDataUrl
-                    val js = """
-                        (function() {
-                            fetch('$url').then(r => r.blob()).then(b => {
-                                var reader = new FileReader();
-                                reader.onloadend = function() {
-                                    if (window.AndroidShell && window.AndroidShell.saveBase64File) {
-                                        var base64 = reader.result.split(',')[1] || '';
-                                        window.AndroidShell.saveBase64File(base64, 'backup_' + Date.now() + '.json', b.type || 'application/json');
-                                    }
-                                };
-                                reader.readAsDataURL(b);
-                            });
-                        })();
-                    """.trimIndent()
-                    webView.evaluateJavascript(js, null)
-                    Toast.makeText(this@MainActivity, "正在导出文件到下载目录…", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "正在导出…", Toast.LENGTH_SHORT).show()
                     return@DownloadListener
                 }
                 val fileName = safeDownloadName(android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType))
@@ -1366,7 +1350,7 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
                 Toast.makeText(this@MainActivity, "下载失败：${it.message}", Toast.LENGTH_SHORT).show()
             }
         })
-        
+
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 if (webVideoCustomView != null) {
@@ -1464,41 +1448,6 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
         }
     }
 
-    /** 把手机系统的白天/黑夜模式同步给 WebView 与网页主题（纯标准 API，零第三方库依赖报错） */
-    private fun syncSystemNightMode() {
-        if (!::webView.isInitialized) return
-        val isNight = (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
-            android.content.res.Configuration.UI_MODE_NIGHT_YES
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            runCatching {
-                @Suppress("DEPRECATION")
-                webView.settings.forceDark = if (isNight) {
-                    android.webkit.WebSettings.FORCE_DARK_ON
-                } else {
-                    android.webkit.WebSettings.FORCE_DARK_OFF
-                }
-            }
-        }
-
-        val mode = if (isNight) "dark" else "light"
-        val js = """
-            (function() {
-                var root = document.documentElement;
-                root.classList.toggle('dark', $isNight);
-                root.setAttribute('data-theme', '$mode');
-                root.style.colorScheme = '$mode';
-                window.dispatchEvent(new CustomEvent('floatshell-themechange', { detail: '$mode' }));
-            })();
-        """.trimIndent()
-        webView.evaluateJavascript(js, null)
-    }
-
-    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
-        super.onConfigurationChanged(newConfig)
-        syncSystemNightMode()
-    }
-
     /**
      * 监听真实状态栏高度（物理像素，经 WindowInsets 实测，隐藏状态栏后依然能拿到原始尺寸）。
      * 不同机型/异形屏/系统字体缩放都会让这个值跟 CSS 的 env(safe-area-inset-top) 估算不一致，
@@ -1542,12 +1491,9 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         // 临时唤出状态栏后、或从锁屏/多任务回来时焦点变化，需要重新隐藏一次
-        if (hasFocus) {
-            hideSystemStatusBar()
-            syncSystemNightMode()
-        }
+        if (hasFocus) hideSystemStatusBar()
     }
-    
+
     /**
      * 点通知的落点。带 sessionId 时通过深链直达对应会话（复用 consumeOpenUrl 的
      * EXTRA_OPEN_URL 通道，来电接听走的就是它）；不带则回首页。
