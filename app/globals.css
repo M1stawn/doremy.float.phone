@@ -90,6 +90,9 @@ body,
   backface-visibility: hidden;
 }
 
-:root {
-  color-scheme: light dark;
+/* 强制告诉浏览器和 WebView：本网页只有浅色底板，请开启系统/浏览器的自动暗色算法 */
+:root,
+html,
+body {
+  color-scheme: only light !important;
 }
