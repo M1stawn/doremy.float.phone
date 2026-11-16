@@ -89,3 +89,7 @@ body,
   background-color: transparent !important;
   backface-visibility: hidden;
 }
+
+:root {
+  color-scheme: light dark;
+}
