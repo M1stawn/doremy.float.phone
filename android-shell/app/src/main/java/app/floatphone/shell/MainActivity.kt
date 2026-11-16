@@ -1154,6 +1154,9 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
             allowFileAccess = false
             userAgentString = "$userAgentString FloatShell/$VERSION"
         }
+        if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.ALGORITHMIC_DARKENING)) {
+            androidx.webkit.WebSettingsCompat.setAlgorithmicDarkeningAllowed(webView.settings, true)
+        }
         CookieManager.getInstance().setAcceptCookie(true)
         // The app embeds cross-site video players (notably Bilibili's official iframe).
         // Third-party cookies must be permitted for those embeds to retain supported session state.
