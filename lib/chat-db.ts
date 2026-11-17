@@ -191,11 +191,13 @@ async function loadFromIndexedDbWithRetries(): Promise<{
     let lastErr: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
         try {
-            let [messages, sessions, contacts] = await Promise.all([
+            const [messages, loadedSessions, loadedContacts] = await Promise.all([
                 chatDb.messages.toArray(),
                 chatDb.sessions.toArray(),
                 chatDb.contacts.toArray(),
             ]);
+            let sessions = loadedSessions;
+            let contacts = loadedContacts;
             if (sessions.length === 0) {
                 const diskSessions = readChatDiskMirror<ChatSession>(LS_SESSIONS_KEY);
                 if (diskSessions.length > 0) {
