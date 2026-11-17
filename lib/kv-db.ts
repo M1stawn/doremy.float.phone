@@ -89,6 +89,67 @@ function removeLegacyLocalStorageKeyIfValue(key: string, value: string): void {
 // localStorage 配额只有 ~5MB,超过这个量级的 value(如自定义APP的整批
 // 音频/封面 dataURL)镜像必失败,setItem 前还得整份拷贝一次内存——直接跳过。
 const LOCAL_STORAGE_MIRROR_MAX_LENGTH = 400_000;
+// ── Android 原生 filesDir 永久磁盘镜像（防止 WebView 清理或未水合空写覆盖）──
+const NATIVE_DISK_MAX_LENGTH = 6_000_000;
+
+type NativeVaultBridge = {
+    saveLocalDiskData?: (key: string, content: string) => boolean;
+    loadLocalDiskData?: (key: string) => string;
+    removeLocalDiskData?: (key: string) => boolean;
+};
+
+function getNativeVaultBridge(): NativeVaultBridge | null {
+    if (typeof window === "undefined") return null;
+    const w = window as unknown as { AndroidShell?: NativeVaultBridge };
+    return w.AndroidShell ?? null;
+}
+
+function isEffectivelyEmptyValue(raw: string | undefined | null): boolean {
+    if (!raw) return true;
+    const t = raw.trim();
+    return t === "" || t === "[]" || t === "{}" || t === "null";
+}
+
+function writeNativeDiskMirror(key: string, value: string): void {
+    if (typeof window === "undefined" || value.length > NATIVE_DISK_MAX_LENGTH) return;
+    try {
+        const bridge = getNativeVaultBridge();
+        if (bridge && typeof bridge.saveLocalDiskData === "function") {
+            // 防止未水合时的空数组/空对象覆盖原生硬盘里已有的完整数据
+            if (!_hydrated && isEffectivelyEmptyValue(value)) return;
+            bridge.saveLocalDiskData(key, value);
+        }
+    } catch {
+        // Ignore native bridge errors
+    }
+}
+
+function readNativeDiskMirror(key: string): string | null {
+    if (typeof window === "undefined") return null;
+    try {
+        const bridge = getNativeVaultBridge();
+        if (bridge && typeof bridge.loadLocalDiskData === "function") {
+            const res = bridge.loadLocalDiskData(key);
+            if (typeof res === "string" && res.length > 0) return res;
+        }
+    } catch {
+        // Ignore native bridge errors
+    }
+    return null;
+}
+
+function removeNativeDiskMirror(key: string): void {
+    if (typeof window === "undefined") return;
+    try {
+        const bridge = getNativeVaultBridge();
+        if (bridge && typeof bridge.removeLocalDiskData === "function") {
+            bridge.removeLocalDiskData(key);
+        }
+    } catch {
+        // Ignore
+    }
+}
+
 
 function writeFallbackLocalStorage(key: string, value: string): void {
     if (typeof window === "undefined" || !isManagedLegacyKey(key)) return;
@@ -154,8 +215,28 @@ export function hydrateKvDb(): Promise<void> {
             }
         }
 
+        // 从安卓原生 filesDir 恢复意外丢失或被清空的核心键值，并将已有 IDB 数据同步落盘到原生磁盘
+        for (const lsKey of _fixedKeys) {
+            const cur = _cache.get(lsKey);
+            if (isEffectivelyEmptyValue(cur)) {
+                const diskVal = readNativeDiskMirror(lsKey);
+                if (diskVal && !isEffectivelyEmptyValue(diskVal)) {
+                    _cache.set(lsKey, diskVal);
+                    batch.push({ key: lsKey, value: diskVal });
+                }
+            } else if (cur) {
+                writeNativeDiskMirror(lsKey, cur);
+            }
+        }
+
         if (batch.length > 0) await kvDb.entries.bulkPut(batch);
         for (const k of removeKeys) localStorage.removeItem(k);
+        try {
+            if (_cache.size > 0) {
+                localStorage.setItem("ai_phone_idb_migrated_v1", "1");
+                localStorage.setItem("ai_phone_settings_idb_migrated_v1", "1");
+            }
+        } catch {}
     })().then(() => {
         _hydrated = true;
         _hydrateError = null;
@@ -185,12 +266,25 @@ export function isKvHydrated(): boolean {
 export function kvGet(key: string): string | null {
     const cached = _cache.get(key);
     if (cached !== undefined) return cached;
+    const diskVal = readNativeDiskMirror(key);
+    if (diskVal !== null) {
+        _cache.set(key, diskVal);
+        return diskVal;
+    }
     return null;
 }
 
 // ── Write: update cache + fire-and-forget to IDB ──
 export function kvSet(key: string, value: string): void {
+    if (!_hydrated && isEffectivelyEmptyValue(value)) {
+        const existingDisk = readNativeDiskMirror(key);
+        if (existingDisk && !isEffectivelyEmptyValue(existingDisk)) {
+            _cache.set(key, existingDisk);
+            return;
+        }
+    }
     _cache.set(key, value);
+    writeNativeDiskMirror(key, value);
     if (isManagedLegacyKey(key)) writeFallbackLocalStorage(key, value);
     kvDb.entries.put({ key, value }).then(() => {
         if (isManagedLegacyKey(key)) removeLegacyLocalStorageKeyIfValue(key, value);
@@ -204,6 +298,7 @@ export function kvSet(key: string, value: string): void {
 
 export async function kvSetAsync(key: string, value: string): Promise<void> {
     _cache.set(key, value);
+    writeNativeDiskMirror(key, value);
     if (isManagedLegacyKey(key)) writeFallbackLocalStorage(key, value);
     try {
         await kvDb.entries.put({ key, value });
@@ -220,6 +315,7 @@ export async function kvSetAsync(key: string, value: string): Promise<void> {
 // ── Delete ──
 export function kvRemove(key: string): void {
     _cache.delete(key);
+    removeNativeDiskMirror(key);
     if (isManagedLegacyKey(key)) removeLegacyLocalStorageKey(key);
     kvDb.entries.delete(key).catch(err =>
         console.warn("[KvDB] delete failed:", key, err));

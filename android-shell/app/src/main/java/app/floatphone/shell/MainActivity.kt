@@ -2587,6 +2587,69 @@ private fun deleteCachedSharedVideoInternal(cacheId: String): Boolean {
             true
             }.getOrDefault(false)
         }
+
+        // ── 本地磁盘永久存储桥（写入手机 filesDir/float_local_vault，不随 WebView 缓存清理丢失）──
+        private fun localVaultDir(): File = File(filesDir, "float_local_vault").apply {
+            if (!exists()) mkdirs()
+        }
+
+        private fun safeVaultKey(key: String): String =
+            key.replace(Regex("[^a-zA-Z0-9._:-]"), "_").take(160)
+
+        @JavascriptInterface
+        fun saveLocalDiskData(key: String, content: String): Boolean {
+            if (!isTrustedShellPage()) return false
+            return runCatching {
+                val safeKey = safeVaultKey(key)
+                if (safeKey.isBlank()) return false
+                val dir = localVaultDir()
+                val target = File(dir, "$safeKey.json")
+                val temp = File(dir, "$safeKey.tmp")
+                temp.writeText(content, Charsets.UTF_8)
+                if (!temp.renameTo(target)) {
+                    target.writeText(content, Charsets.UTF_8)
+                    temp.delete()
+                }
+                true
+            }.getOrDefault(false)
+        }
+
+        @JavascriptInterface
+        fun loadLocalDiskData(key: String): String {
+            if (!isTrustedShellPage()) return ""
+            return runCatching {
+                val safeKey = safeVaultKey(key)
+                if (safeKey.isBlank()) return ""
+                val target = File(localVaultDir(), "$safeKey.json")
+                if (target.isFile) target.readText(Charsets.UTF_8) else ""
+            }.getOrDefault("")
+        }
+
+        @JavascriptInterface
+        fun removeLocalDiskData(key: String): Boolean {
+            if (!isTrustedShellPage()) return false
+            return runCatching {
+                val safeKey = safeVaultKey(key)
+                if (safeKey.isBlank()) return false
+                val target = File(localVaultDir(), "$safeKey.json")
+                if (target.exists()) target.delete() else true
+            }.getOrDefault(false)
+        }
+
+        @JavascriptInterface
+        fun listLocalDiskKeys(): String {
+            if (!isTrustedShellPage()) return "[]"
+            return runCatching {
+                val files = localVaultDir().listFiles() ?: emptyArray()
+                val arr = org.json.JSONArray()
+                for (f in files) {
+                    if (f.isFile && f.name.endsWith(".json")) {
+                        arr.put(f.name.removeSuffix(".json"))
+                    }
+                }
+                arr.toString()
+            }.getOrDefault("[]")
+        }
     }
 
     /**

@@ -393,9 +393,18 @@ async function readKvRecords(source: KvSource): Promise<{ key: string; value: st
     db.close();
   }
 
-  // 内存缓存仍然要并进来：kvSet 是先写缓存再异步落盘，缓存可能比 IndexedDB 新
+  // 内存缓存并入时防止未水合的空数组/空对象反杀 IndexedDB 里的完整历史记录
+  const isEffectivelyEmptyExportValue = (val: string) => {
+    const t = val.trim();
+    return t === "" || t === "[]" || t === "{}" || t === "null";
+  };
   for (const record of kvEntries()) {
-    if (matchesKey(record.key, source)) byKey.set(record.key, record);
+    if (!matchesKey(record.key, source)) continue;
+    const existing = byKey.get(record.key);
+    if (existing && !isEffectivelyEmptyExportValue(existing.value) && isEffectivelyEmptyExportValue(record.value)) {
+      continue;
+    }
+    byKey.set(record.key, record);
   }
   return Array.from(byKey.values()).sort((a, b) => a.key.localeCompare(b.key));
 }
