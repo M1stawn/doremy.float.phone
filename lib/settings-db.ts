@@ -39,6 +39,43 @@ let _regexes: RegexConfig[] | null = null;
 let _hydrated = false;
 let _presetsWriteQueue: Promise<void> = Promise.resolve();
 
+
+// ── Android 原生 filesDir 永久磁盘镜像（防止 WebView 事务中断或空覆盖）──
+type NativeVaultBridge = {
+    saveLocalDiskData?: (key: string, content: string) => boolean;
+    loadLocalDiskData?: (key: string) => string;
+};
+function getNativeVaultBridge(): NativeVaultBridge | null {
+    if (typeof window === "undefined") return null;
+    const w = window as unknown as { AndroidShell?: NativeVaultBridge };
+    return w.AndroidShell ?? null;
+}
+function writeSettingsDiskMirror<T>(key: string, items: T[]): void {
+    if (typeof window === "undefined") return;
+    try {
+        const bridge = getNativeVaultBridge();
+        if (bridge && typeof bridge.saveLocalDiskData === "function") {
+            if (!_hydrated && items.length === 0) return;
+            const raw = JSON.stringify(items);
+            if (raw.length <= 6_000_000) bridge.saveLocalDiskData(key, raw);
+        }
+    } catch {}
+}
+function readSettingsDiskMirror<T>(key: string): T[] {
+    if (typeof window === "undefined") return [];
+    try {
+        const bridge = getNativeVaultBridge();
+        if (bridge && typeof bridge.loadLocalDiskData === "function") {
+            const raw = bridge.loadLocalDiskData(key);
+            if (raw && raw.trim().length > 2) {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) return parsed as T[];
+            }
+        }
+    } catch {}
+    return [];
+}
+
 function safeParse<T>(raw: string | null): T[] {
     try { return raw ? JSON.parse(raw) : []; } catch { return []; }
 }
@@ -106,24 +143,63 @@ export async function hydrateSettingsDb(): Promise<void> {
             _regexes = safeParse(window.localStorage.getItem(LS_REGEXES_KEY));
         }
     } else {
-        // Already migrated: load from IndexedDB
+        // Already migrated: load from IndexedDB with native disk mirror fallback
         try {
-            const [presets, worldBooks, regexes] = await Promise.all([
+            let [presets, worldBooks, regexes] = await Promise.all([
                 settingsDb.presets.toArray(),
                 settingsDb.worldBooks.toArray(),
                 settingsDb.regexes.toArray(),
             ]);
+            if (presets.length === 0) {
+                const diskPresets = readSettingsDiskMirror<PresetConfig>(LS_PRESETS_KEY);
+                if (diskPresets.length > 0) {
+                    presets = diskPresets;
+                    await settingsDb.presets.bulkPut(diskPresets).catch(() => {});
+                }
+            } else {
+                writeSettingsDiskMirror(LS_PRESETS_KEY, presets);
+            }
+            if (worldBooks.length === 0) {
+                const diskBooks = readSettingsDiskMirror<WorldBookConfig>(LS_WORLDBOOKS_KEY);
+                if (diskBooks.length > 0) {
+                    worldBooks = diskBooks;
+                    await settingsDb.worldBooks.bulkPut(diskBooks).catch(() => {});
+                }
+            } else {
+                writeSettingsDiskMirror(LS_WORLDBOOKS_KEY, worldBooks);
+            }
+            if (regexes.length === 0) {
+                const diskRegexes = readSettingsDiskMirror<RegexConfig>(LS_REGEXES_KEY);
+                if (diskRegexes.length > 0) {
+                    regexes = diskRegexes;
+                    await settingsDb.regexes.bulkPut(diskRegexes).catch(() => {});
+                }
+            } else {
+                writeSettingsDiskMirror(LS_REGEXES_KEY, regexes);
+            }
             _presets = presets;
             _worldBooks = worldBooks;
             _regexes = regexes;
+            _hydrated = true;
             console.log(`[SettingsDB] Loaded: ${presets.length} presets, ${worldBooks.length} worldBooks, ${regexes.length} regexes`);
+            return;
         } catch (err) {
             console.error("[SettingsDB] Failed to load from IndexedDB:", err);
-            _presets = [];
-            _worldBooks = [];
-            _regexes = [];
+            const diskPresets = readSettingsDiskMirror<PresetConfig>(LS_PRESETS_KEY);
+            const diskBooks = readSettingsDiskMirror<WorldBookConfig>(LS_WORLDBOOKS_KEY);
+            const diskRegexes = readSettingsDiskMirror<RegexConfig>(LS_REGEXES_KEY);
+            if (diskPresets.length > 0 || diskBooks.length > 0 || diskRegexes.length > 0) {
+                _presets = diskPresets;
+                _worldBooks = diskBooks;
+                _regexes = diskRegexes;
+                _hydrated = true;
+            }
+            return;
         }
     }
+    if (_presets && _presets.length > 0) writeSettingsDiskMirror(LS_PRESETS_KEY, _presets);
+    if (_worldBooks && _worldBooks.length > 0) writeSettingsDiskMirror(LS_WORLDBOOKS_KEY, _worldBooks);
+    if (_regexes && _regexes.length > 0) writeSettingsDiskMirror(LS_REGEXES_KEY, _regexes);
     _hydrated = true;
 }
 
@@ -166,6 +242,7 @@ function enqueuePresetsPersist(presets: PresetConfig[], warnInQueue: boolean): P
 
 export function writePresetsCache(presets: PresetConfig[]): void {
     _presets = presets;
+    writeSettingsDiskMirror(LS_PRESETS_KEY, presets);
     if (!_hydrated && typeof window !== "undefined") {
         console.warn("[SettingsDB] writePresetsCache before hydration; using additive write to avoid replacing existing presets.");
         settingsDb.presets.bulkPut(presets).catch(err => console.warn("[SettingsDB] additive save presets failed:", err));
@@ -176,6 +253,7 @@ export function writePresetsCache(presets: PresetConfig[]): void {
 
 export async function writePresetsCacheAsync(presets: PresetConfig[]): Promise<void> {
     _presets = presets;
+    writeSettingsDiskMirror(LS_PRESETS_KEY, presets);
     if (!_hydrated && typeof window !== "undefined") {
         console.warn("[SettingsDB] writePresetsCacheAsync before hydration; using additive write to avoid replacing existing presets.");
         await settingsDb.presets.bulkPut(presets);
@@ -191,6 +269,7 @@ export async function writePresetsCacheAsync(presets: PresetConfig[]): Promise<v
 
 export function writeWorldBooksCache(books: WorldBookConfig[]): void {
     _worldBooks = books;
+    writeSettingsDiskMirror(LS_WORLDBOOKS_KEY, books);
     if (!_hydrated && typeof window !== "undefined") {
         console.warn("[SettingsDB] writeWorldBooksCache before hydration; using additive write to avoid replacing existing worldBooks.");
         settingsDb.worldBooks.bulkPut(books).catch(err => console.warn("[SettingsDB] additive save worldBooks failed:", err));
@@ -204,6 +283,7 @@ export function writeWorldBooksCache(books: WorldBookConfig[]): void {
 
 export function writeRegexesCache(regexes: RegexConfig[]): void {
     _regexes = regexes;
+    writeSettingsDiskMirror(LS_REGEXES_KEY, regexes);
     if (!_hydrated && typeof window !== "undefined") {
         console.warn("[SettingsDB] writeRegexesCache before hydration; using additive write to avoid replacing existing regexes.");
         settingsDb.regexes.bulkPut(regexes).catch(err => console.warn("[SettingsDB] additive save regexes failed:", err));

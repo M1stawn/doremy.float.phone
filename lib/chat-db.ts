@@ -31,6 +31,42 @@ const LS_SESSIONS_KEY = "ai_phone_chat_sessions_v1";
 const LS_CONTACTS_KEY = "ai_phone_chat_contacts_v1";
 const LS_MIGRATED_FLAG = "ai_phone_idb_migrated_v1";
 
+// ── Android 原生 filesDir 永久磁盘镜像（防止删聊天退后台时 clear+bulkPut 中断丢失会话与联系人）──
+type NativeVaultBridge = {
+    saveLocalDiskData?: (key: string, content: string) => boolean;
+    loadLocalDiskData?: (key: string) => string;
+};
+function getNativeVaultBridge(): NativeVaultBridge | null {
+    if (typeof window === "undefined") return null;
+    const w = window as unknown as { AndroidShell?: NativeVaultBridge };
+    return w.AndroidShell ?? null;
+}
+function writeChatDiskMirror<T>(key: string, items: T[]): void {
+    if (typeof window === "undefined") return;
+    try {
+        const bridge = getNativeVaultBridge();
+        if (bridge && typeof bridge.saveLocalDiskData === "function") {
+            const raw = JSON.stringify(items);
+            if (raw.length <= 6_000_000) bridge.saveLocalDiskData(key, raw);
+        }
+    } catch {}
+}
+function readChatDiskMirror<T>(key: string): T[] {
+    if (typeof window === "undefined") return [];
+    try {
+        const bridge = getNativeVaultBridge();
+        if (bridge && typeof bridge.loadLocalDiskData === "function") {
+            const raw = bridge.loadLocalDiskData(key);
+            if (raw && raw.trim().length > 2) {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) return parsed as T[];
+            }
+        }
+    } catch {}
+    return [];
+}
+
+
 /**
  * Initialize IndexedDB and migrate data from localStorage if needed.
  * Returns the loaded data for the in-memory caches.
@@ -155,11 +191,29 @@ async function loadFromIndexedDbWithRetries(): Promise<{
     let lastErr: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
         try {
-            const [messages, sessions, contacts] = await Promise.all([
+            let [messages, sessions, contacts] = await Promise.all([
                 chatDb.messages.toArray(),
                 chatDb.sessions.toArray(),
                 chatDb.contacts.toArray(),
             ]);
+            if (sessions.length === 0) {
+                const diskSessions = readChatDiskMirror<ChatSession>(LS_SESSIONS_KEY);
+                if (diskSessions.length > 0) {
+                    sessions = diskSessions;
+                    await chatDb.sessions.bulkPut(diskSessions).catch(() => {});
+                }
+            } else {
+                writeChatDiskMirror(LS_SESSIONS_KEY, sessions);
+            }
+            if (contacts.length === 0) {
+                const diskContacts = readChatDiskMirror<ChatContact>(LS_CONTACTS_KEY);
+                if (diskContacts.length > 0) {
+                    contacts = diskContacts;
+                    await chatDb.contacts.bulkPut(diskContacts).catch(() => {});
+                }
+            } else {
+                writeChatDiskMirror(LS_CONTACTS_KEY, contacts);
+            }
             console.log(`[ChatDB] Loaded from IndexedDB: ${messages.length} messages, ${sessions.length} sessions, ${contacts.length} contacts`);
             return { messages, sessions, contacts };
         } catch (err) {
@@ -218,10 +272,12 @@ export function dbPutSession(session: ChatSession): void {
 }
 
 export function dbPutSessions(sessions: ChatSession[]): void {
+    writeChatDiskMirror(LS_SESSIONS_KEY, sessions);
     chatDb.sessions.bulkPut(sessions).catch(err => console.warn("[ChatDB] bulkPut sessions failed:", err));
 }
 
 export function dbReplaceSessions(sessions: ChatSession[]): void {
+    writeChatDiskMirror(LS_SESSIONS_KEY, sessions);
     chatDb.transaction("rw", chatDb.sessions, async () => {
         await chatDb.sessions.clear();
         await chatDb.sessions.bulkPut(sessions);
@@ -233,6 +289,7 @@ export function dbDeleteSession(id: string): void {
 }
 
 export function dbPutContacts(contacts: ChatContact[]): void {
+    writeChatDiskMirror(LS_CONTACTS_KEY, contacts);
     chatDb.contacts.bulkPut(contacts).catch(err => console.warn("[ChatDB] bulkPut contacts failed:", err));
 }
 
@@ -241,6 +298,7 @@ export function dbClearContacts(): void {
 }
 
 export function dbReplaceContacts(contacts: ChatContact[]): void {
+    writeChatDiskMirror(LS_CONTACTS_KEY, contacts);
     chatDb.transaction("rw", chatDb.contacts, async () => {
         await chatDb.contacts.clear();
         await chatDb.contacts.bulkPut(contacts);

@@ -17,6 +17,8 @@ import { OfflinePushRevampAnnouncement } from "./offline-push-revamp-announcemen
 import { SplashAnimation } from "./splash-animation";
 import { MusicProvider } from "@/lib/music-context";
 import { hydrateKvDb, isKvHydrated } from "@/lib/kv-db";
+import { hydrateSettingsDb, isSettingsHydrated } from "@/lib/settings-db";
+import { hydrateChatStorage, isChatStorageHydrated } from "@/lib/chat-storage";
 import { getThemeAssetMap, readThemeProfile } from "@/lib/theme-storage";
 import { resolveActiveIconSkins, type ThemeProfile } from "@/lib/theme-types";
 import { hasPendingMcpOAuthCallback } from "@/lib/tool-executor";
@@ -271,11 +273,14 @@ export function MainApp() {
     void navigator.storage?.persist?.().catch(() => {});
 
     void (async () => {
-      await hydrateKvDb();
+      await Promise.all([
+        hydrateKvDb(),
+        hydrateSettingsDb(),
+        hydrateChatStorage(),
+      ]);
       if (cancelled) return;
-      // 水合失败绝不放行：此时所有 KV 数据（设置/绑定/线下记录等）在内存里都是
-      // 空的，进入后任何一次保存都会拿空数据整包覆盖 IndexedDB 里的真实历史。
-      if (!isKvHydrated()) {
+      // 水合失败绝不放行：此时核心数据库在内存里是空的，进入后任何一次保存都会拿空数据覆盖真实历史。
+      if (!isKvHydrated() || !isSettingsHydrated() || !isChatStorageHydrated()) {
         setKvHydrateFailed(true);
         return;
       }

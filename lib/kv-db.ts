@@ -96,6 +96,7 @@ type NativeVaultBridge = {
     saveLocalDiskData?: (key: string, content: string) => boolean;
     loadLocalDiskData?: (key: string) => string;
     removeLocalDiskData?: (key: string) => boolean;
+    listLocalDiskKeys?: () => string;
 };
 
 function getNativeVaultBridge(): NativeVaultBridge | null {
@@ -215,8 +216,26 @@ export function hydrateKvDb(): Promise<void> {
             }
         }
 
-        // 从安卓原生 filesDir 恢复意外丢失或被清空的核心键值，并将已有 IDB 数据同步落盘到原生磁盘
-        for (const lsKey of _fixedKeys) {
+        // 从安卓原生 filesDir 恢复意外丢失或被清空的核心键值与动态前缀键值，并将已有 IDB 数据同步落盘到原生磁盘
+        const allKeysToSync = new Set<string>(_fixedKeys);
+        for (const k of _cache.keys()) allKeysToSync.add(k);
+        try {
+            const bridge = getNativeVaultBridge();
+            if (bridge && typeof bridge.listLocalDiskKeys === "function") {
+                const rawList = bridge.listLocalDiskKeys();
+                if (rawList) {
+                    const parsedKeys = JSON.parse(rawList);
+                    if (Array.isArray(parsedKeys)) {
+                        for (const dk of parsedKeys) {
+                            if (typeof dk === "string" && (_fixedKeys.includes(dk) || matchesDynamicPrefix(dk))) {
+                                allKeysToSync.add(dk);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch {}
+        for (const lsKey of allKeysToSync) {
             const cur = _cache.get(lsKey);
             if (isEffectivelyEmptyValue(cur)) {
                 const diskVal = readNativeDiskMirror(lsKey);
