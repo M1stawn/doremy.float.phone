@@ -51,6 +51,42 @@ function writeChatDiskMirror<T>(key: string, items: T[]): void {
         }
     } catch {}
 }
+function writeMessagesDiskMirror(messages: ChatMessage[]): void {
+    if (typeof window === "undefined" || !messages || messages.length === 0) return;
+    try {
+        const bridge = getNativeVaultBridge();
+        if (bridge && typeof bridge.saveLocalDiskData === "function") {
+            // 保留每个会话最近 100 条消息作为防灾镜像
+            const bySession = new Map<string, ChatMessage[]>();
+            for (const m of messages) {
+                if (!m || !m.sessionId) continue;
+                const arr = bySession.get(m.sessionId) || [];
+                arr.push(m);
+                bySession.set(m.sessionId, arr);
+            }
+            const bounded: ChatMessage[] = [];
+            for (const list of bySession.values()) {
+                bounded.push(...list.slice(-100));
+            }
+            const raw = JSON.stringify(bounded);
+            if (raw.length <= 6_000_000) bridge.saveLocalDiskData(LS_MESSAGES_KEY, raw);
+        }
+    } catch {}
+}
+function readMessagesDiskMirror(): ChatMessage[] {
+    if (typeof window === "undefined") return [];
+    try {
+        const bridge = getNativeVaultBridge();
+        if (bridge && typeof bridge.loadLocalDiskData === "function") {
+            const raw = bridge.loadLocalDiskData(LS_MESSAGES_KEY);
+            if (raw && raw.trim().length > 2) {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) return parsed as ChatMessage[];
+            }
+        }
+    } catch {}
+    return [];
+}
 function readChatDiskMirror<T>(key: string): T[] {
     if (typeof window === "undefined") return [];
     try {
@@ -124,6 +160,24 @@ export async function initChatDb(): Promise<{
             markMigrated();
             console.log(`[ChatDB] Migration flag missing but IndexedDB has data; reusing it: ${messages.length} messages, ${sessions.length} sessions, ${contacts.length} contacts`);
             return { messages, sessions, contacts };
+        }
+
+        // 优先检查原生磁盘保险箱：如果原生磁盘有真实的现代数据，直接用原生磁盘，严禁读取 localStorage 远古幽灵记录
+        const diskSessions = readChatDiskMirror<ChatSession>(LS_SESSIONS_KEY);
+        const diskContacts = readChatDiskMirror<ChatContact>(LS_CONTACTS_KEY);
+        const diskMessages = readMessagesDiskMirror();
+        if (diskSessions.length > 0 || diskContacts.length > 0) {
+            console.log("[ChatDB] Recovered from Native Vault instead of stale localStorage");
+            markMigrated();
+            try {
+                window.localStorage.removeItem(LS_MESSAGES_KEY);
+                window.localStorage.removeItem(LS_SESSIONS_KEY);
+                window.localStorage.removeItem(LS_CONTACTS_KEY);
+            } catch {}
+            if (diskMessages.length > 0) await chatDb.messages.bulkPut(diskMessages).catch(() => {});
+            if (diskSessions.length > 0) await chatDb.sessions.bulkPut(diskSessions).catch(() => {});
+            if (diskContacts.length > 0) await chatDb.contacts.bulkPut(diskContacts).catch(() => {});
+            return { messages: diskMessages, sessions: diskSessions, contacts: diskContacts };
         }
 
         // First run after migration: move localStorage data → IndexedDB
@@ -243,6 +297,9 @@ export function dbPutMessage(msg: ChatMessage): void {
 
 export function dbPutMessages(msgs: ChatMessage[]): void {
     chatDb.messages.bulkPut(msgs).catch(err => console.warn("[ChatDB] bulkPut messages failed:", err));
+    try {
+        chatDb.messages.toArray().then(all => writeMessagesDiskMirror(all)).catch(() => {});
+    } catch {}
 }
 
 // 可等待、错误上抛、分块提交的批量写入。导入聊天记录这类大批量落库必须
@@ -254,6 +311,10 @@ export async function dbBulkPutMessages(msgs: ChatMessage[]): Promise<void> {
     for (let start = 0; start < msgs.length; start += DB_BULK_PUT_CHUNK) {
         await chatDb.messages.bulkPut(msgs.slice(start, start + DB_BULK_PUT_CHUNK));
     }
+    try {
+        const all = await chatDb.messages.toArray();
+        writeMessagesDiskMirror(all);
+    } catch {}
 }
 
 export function dbDeleteMessage(id: string): void {
