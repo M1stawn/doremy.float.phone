@@ -78,6 +78,16 @@ function writeMessagesDiskMirror(messages: ChatMessage[]): void {
         }
     } catch {}
 }
+
+let _msgMirrorTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleMessagesDiskMirror(): void {
+    if (typeof window === "undefined") return;
+    if (_msgMirrorTimer) clearTimeout(_msgMirrorTimer);
+    _msgMirrorTimer = setTimeout(() => {
+        _msgMirrorTimer = null;
+        chatDb.messages.toArray().then(all => writeMessagesDiskMirror(all)).catch(() => {});
+    }, 1200);
+}
 function readMessagesDiskMirror(): ChatMessage[] {
     if (typeof window === "undefined") return [];
     try {
