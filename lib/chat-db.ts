@@ -56,7 +56,6 @@ function writeMessagesDiskMirror(messages: ChatMessage[]): void {
     try {
         const bridge = getNativeVaultBridge();
         if (bridge && typeof bridge.saveLocalDiskData === "function") {
-            // 保留每个会话最近 100 条消息作为防灾镜像
             const bySession = new Map<string, ChatMessage[]>();
             for (const m of messages) {
                 if (!m || !m.sessionId) continue;
@@ -64,34 +63,68 @@ function writeMessagesDiskMirror(messages: ChatMessage[]): void {
                 arr.push(m);
                 bySession.set(m.sessionId, arr);
             }
-            const bounded: ChatMessage[] = [];
-            for (const list of bySession.values()) {
-                bounded.push(...list.slice(-100));
+            // 1. 每个 session 独立保存完整历史，绝不截断到 100 条
+            for (const [sessId, list] of bySession.entries()) {
+                const sessRaw = JSON.stringify(list);
+                if (sessRaw.length <= 6_000_000) {
+                    bridge.saveLocalDiskData('msg_sess_' + sessId, sessRaw);
+                }
             }
-            const raw = JSON.stringify(bounded);
-            if (raw.length <= 6_000_000) bridge.saveLocalDiskData(LS_MESSAGES_KEY, raw);
+            // 2. 总清单落盘，尽可能全量保存
+            const raw = JSON.stringify(messages);
+            if (raw.length <= 6_000_000) {
+                bridge.saveLocalDiskData(LS_MESSAGES_KEY, raw);
+            }
         }
     } catch {}
-}
-let _msgMirrorTimer: ReturnType<typeof setTimeout> | null = null;
-function scheduleMessagesDiskMirror(): void {
-    if (typeof window === "undefined") return;
-    if (_msgMirrorTimer) clearTimeout(_msgMirrorTimer);
-    _msgMirrorTimer = setTimeout(() => {
-        _msgMirrorTimer = null;
-        chatDb.messages.toArray().then(all => writeMessagesDiskMirror(all)).catch(() => {});
-    }, 1200);
 }
 function readMessagesDiskMirror(): ChatMessage[] {
     if (typeof window === "undefined") return [];
     try {
         const bridge = getNativeVaultBridge();
         if (bridge && typeof bridge.loadLocalDiskData === "function") {
+            const combined: ChatMessage[] = [];
+            const seenIds = new Set<string>();
+            // 1. 如果有 listLocalDiskKeys，把所有独立会话的完整历史全读回来
+            const listFn = (bridge as unknown as { listLocalDiskKeys?: () => string }).listLocalDiskKeys;
+            if (typeof listFn === "function") {
+                const keysRaw = listFn();
+                if (keysRaw) {
+                    try {
+                        const keys = JSON.parse(keysRaw) as string[];
+                        for (const k of keys) {
+                            if (k && k.startsWith('msg_sess_')) {
+                                const sessRaw = bridge.loadLocalDiskData(k);
+                                if (sessRaw) {
+                                    const msgs = JSON.parse(sessRaw) as ChatMessage[];
+                                    for (const m of msgs) {
+                                        if (m && m.id && !seenIds.has(m.id)) {
+                                            seenIds.add(m.id);
+                                            combined.push(m);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch {}
+                }
+            }
+            // 2. 补充总清单中的消息
             const raw = bridge.loadLocalDiskData(LS_MESSAGES_KEY);
             if (raw && raw.trim().length > 2) {
-                const parsed = JSON.parse(raw);
-                if (Array.isArray(parsed)) return parsed as ChatMessage[];
+                try {
+                    const parsed = JSON.parse(raw) as ChatMessage[];
+                    if (Array.isArray(parsed)) {
+                        for (const m of parsed) {
+                            if (m && m.id && !seenIds.has(m.id)) {
+                                seenIds.add(m.id);
+                                combined.push(m);
+                            }
+                        }
+                    }
+                } catch {}
             }
+            if (combined.length > 0) return combined;
         }
     } catch {}
     return [];
