@@ -237,7 +237,7 @@ export function hydrateKvDb(): Promise<void> {
         } catch {}
         for (const lsKey of allKeysToSync) {
             const cur = _cache.get(lsKey);
-            if (isEffectivelyEmptyValue(cur)) {
+            if (cur === undefined) {
                 const diskVal = readNativeDiskMirror(lsKey);
                 if (diskVal && !isEffectivelyEmptyValue(diskVal)) {
                     _cache.set(lsKey, diskVal);

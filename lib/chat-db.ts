@@ -31,16 +31,20 @@ const LS_SESSIONS_KEY = "ai_phone_chat_sessions_v1";
 const LS_CONTACTS_KEY = "ai_phone_chat_contacts_v1";
 const LS_MIGRATED_FLAG = "ai_phone_idb_migrated_v1";
 
-// ── Android 原生 filesDir 永久磁盘镜像（防止删聊天退后台时 clear+bulkPut 中断丢失会话与联系人）──
+// ── Android 原生 filesDir 永久磁盘分片镜像（支持 49MB+ 单角色超长记录分片落盘 & 删除时物理清除防复活）──
 type NativeVaultBridge = {
     saveLocalDiskData?: (key: string, content: string) => boolean;
     loadLocalDiskData?: (key: string) => string;
+    removeLocalDiskData?: (key: string) => boolean;
+    listLocalDiskKeys?: () => string;
 };
 function getNativeVaultBridge(): NativeVaultBridge | null {
     if (typeof window === "undefined") return null;
     const w = window as unknown as { AndroidShell?: NativeVaultBridge };
     return w.AndroidShell ?? null;
 }
+const MAX_CHUNK_CHARS = 3_500_000;
+
 function writeChatDiskMirror<T>(key: string, items: T[]): void {
     if (typeof window === "undefined") return;
     try {
@@ -51,30 +55,100 @@ function writeChatDiskMirror<T>(key: string, items: T[]): void {
         }
     } catch {}
 }
-function writeMessagesDiskMirror(messages: ChatMessage[]): void {
-    if (typeof window === "undefined" || !messages || messages.length === 0) return;
+
+function removeSessionDiskChunks(sessionId: string): void {
+    if (typeof window === "undefined" || !sessionId) return;
     try {
         const bridge = getNativeVaultBridge();
-        if (bridge && typeof bridge.saveLocalDiskData === "function") {
-            const bySession = new Map<string, ChatMessage[]>();
-            for (const m of messages) {
-                if (!m || !m.sessionId) continue;
-                const arr = bySession.get(m.sessionId) || [];
-                arr.push(m);
-                bySession.set(m.sessionId, arr);
+        if (!bridge || typeof bridge.removeLocalDiskData !== "function") return;
+        bridge.removeLocalDiskData("msg_sess_" + sessionId);
+        if (typeof bridge.loadLocalDiskData === "function") {
+            const metaRaw = bridge.loadLocalDiskData("msg_meta_" + sessionId);
+            if (metaRaw) {
+                try {
+                    const meta = JSON.parse(metaRaw) as { chunks?: number };
+                    const count = Number(meta?.chunks || 0);
+                    for (let i = 0; i < count; i++) {
+                        bridge.removeLocalDiskData("msg_sess_" + sessionId + "_p" + i);
+                    }
+                } catch {}
             }
-            // 1. 每个 session 独立保存完整历史，绝不截断到 100 条
-            for (const [sessId, list] of bySession.entries()) {
-                const sessRaw = JSON.stringify(list);
-                if (sessRaw.length <= 6_000_000) {
-                    bridge.saveLocalDiskData('msg_sess_' + sessId, sessRaw);
+        }
+        bridge.removeLocalDiskData("msg_meta_" + sessionId);
+    } catch {}
+}
+
+function writeSingleSessionDiskMirror(sessionId: string, list: ChatMessage[]): void {
+    if (typeof window === "undefined" || !sessionId) return;
+    try {
+        const bridge = getNativeVaultBridge();
+        if (!bridge || typeof bridge.saveLocalDiskData !== "function") return;
+        if (!list || list.length === 0) {
+            removeSessionDiskChunks(sessionId);
+            return;
+        }
+        const fullRaw = JSON.stringify(list);
+        if (fullRaw.length <= MAX_CHUNK_CHARS) {
+            bridge.saveLocalDiskData("msg_sess_" + sessionId + "_p0", fullRaw);
+            bridge.saveLocalDiskData("msg_meta_" + sessionId, JSON.stringify({ chunks: 1, updatedAt: Date.now() }));
+            if (typeof bridge.removeLocalDiskData === "function") {
+                bridge.removeLocalDiskData("msg_sess_" + sessionId);
+            }
+            return;
+        }
+        const chunks: string[] = [];
+        let currentBatch: ChatMessage[] = [];
+        let currentLen = 2;
+        for (const msg of list) {
+            const itemStr = JSON.stringify(msg);
+            if (currentBatch.length > 0 && currentLen + itemStr.length + 1 > MAX_CHUNK_CHARS) {
+                chunks.push(JSON.stringify(currentBatch));
+                currentBatch = [msg];
+                currentLen = 2 + itemStr.length;
+            } else {
+                currentBatch.push(msg);
+                currentLen += itemStr.length + 1;
+            }
+        }
+        if (currentBatch.length > 0) chunks.push(JSON.stringify(currentBatch));
+        for (let i = 0; i < chunks.length; i++) {
+            bridge.saveLocalDiskData("msg_sess_" + sessionId + "_p" + i, chunks[i]);
+        }
+        bridge.saveLocalDiskData("msg_meta_" + sessionId, JSON.stringify({ chunks: chunks.length, updatedAt: Date.now() }));
+    } catch {}
+}
+
+function writeMessagesDiskMirror(messages: ChatMessage[]): void {
+    if (typeof window === "undefined" || !messages) return;
+    try {
+        const bridge = getNativeVaultBridge();
+        if (!bridge || typeof bridge.saveLocalDiskData !== "function") return;
+        const bySession = new Map<string, ChatMessage[]>();
+        for (const m of messages) {
+            if (!m || !m.sessionId) continue;
+            const arr = bySession.get(m.sessionId) || [];
+            arr.push(m);
+            bySession.set(m.sessionId, arr);
+        }
+        for (const [sessId, list] of bySession.entries()) {
+            writeSingleSessionDiskMirror(sessId, list);
+        }
+        if (typeof bridge.listLocalDiskKeys === "function" && typeof bridge.removeLocalDiskData === "function") {
+            try {
+                const keys = JSON.parse(bridge.listLocalDiskKeys() || "[]") as string[];
+                for (const k of keys) {
+                    if (k.startsWith("msg_meta_")) {
+                        const sid = k.slice("msg_meta_".length);
+                        if (!bySession.has(sid)) removeSessionDiskChunks(sid);
+                    } else if (k.startsWith("msg_sess_") && !k.includes("_p")) {
+                        const sid = k.slice("msg_sess_".length);
+                        if (!bySession.has(sid)) bridge.removeLocalDiskData(k);
+                    }
                 }
-            }
-            // 2. 总清单落盘，尽可能全量保存
-            const raw = JSON.stringify(messages);
-            if (raw.length <= 6_000_000) {
-                bridge.saveLocalDiskData(LS_MESSAGES_KEY, raw);
-            }
+            } catch {}
+        }
+        if (typeof bridge.removeLocalDiskData === "function") {
+            bridge.removeLocalDiskData(LS_MESSAGES_KEY);
         }
     } catch {}
 }
@@ -88,57 +162,51 @@ function scheduleMessagesDiskMirror(): void {
         chatDb.messages.toArray().then(all => writeMessagesDiskMirror(all)).catch(() => {});
     }, 1200);
 }
+
 function readMessagesDiskMirror(): ChatMessage[] {
     if (typeof window === "undefined") return [];
     try {
         const bridge = getNativeVaultBridge();
-        if (bridge && typeof bridge.loadLocalDiskData === "function") {
-            const combined: ChatMessage[] = [];
-            const seenIds = new Set<string>();
-            // 1. 如果有 listLocalDiskKeys，把所有独立会话的完整历史全读回来
-            const listFn = (bridge as unknown as { listLocalDiskKeys?: () => string }).listLocalDiskKeys;
-            if (typeof listFn === "function") {
-                const keysRaw = listFn();
-                if (keysRaw) {
-                    try {
-                        const keys = JSON.parse(keysRaw) as string[];
-                        for (const k of keys) {
-                            if (k && k.startsWith('msg_sess_')) {
-                                const sessRaw = bridge.loadLocalDiskData(k);
-                                if (sessRaw) {
-                                    const msgs = JSON.parse(sessRaw) as ChatMessage[];
-                                    for (const m of msgs) {
-                                        if (m && m.id && !seenIds.has(m.id)) {
-                                            seenIds.add(m.id);
-                                            combined.push(m);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } catch {}
+        if (!bridge || typeof bridge.loadLocalDiskData !== "function") return [];
+        const combined: ChatMessage[] = [];
+        const seenIds = new Set<string>();
+        const addMsgs = (arr: unknown) => {
+            if (!Array.isArray(arr)) return;
+            for (const m of arr) {
+                if (m && typeof m === "object" && "id" in m && typeof (m as ChatMessage).id === "string") {
+                    const msg = m as ChatMessage;
+                    if (!seenIds.has(msg.id)) {
+                        seenIds.add(msg.id);
+                        combined.push(msg);
+                    }
                 }
             }
-            // 2. 补充总清单中的消息
-            const raw = bridge.loadLocalDiskData(LS_MESSAGES_KEY);
-            if (raw && raw.trim().length > 2) {
-                try {
-                    const parsed = JSON.parse(raw) as ChatMessage[];
-                    if (Array.isArray(parsed)) {
-                        for (const m of parsed) {
-                            if (m && m.id && !seenIds.has(m.id)) {
-                                seenIds.add(m.id);
-                                combined.push(m);
-                            }
+        };
+        if (typeof bridge.listLocalDiskKeys === "function") {
+            const keys = JSON.parse(bridge.listLocalDiskKeys() || "[]") as string[];
+            for (const k of keys) {
+                if (k.startsWith("msg_meta_")) {
+                    const sid = k.slice("msg_meta_".length);
+                    const metaRaw = bridge.loadLocalDiskData(k);
+                    if (metaRaw) {
+                        const meta = JSON.parse(metaRaw) as { chunks?: number };
+                        const count = Number(meta?.chunks || 0);
+                        for (let i = 0; i < count; i++) {
+                            const chunkRaw = bridge.loadLocalDiskData("msg_sess_" + sid + "_p" + i);
+                            if (chunkRaw) addMsgs(JSON.parse(chunkRaw));
                         }
                     }
-                } catch {}
+                } else if (k.startsWith("msg_sess_") && !k.includes("_p")) {
+                    const raw = bridge.loadLocalDiskData(k);
+                    if (raw) addMsgs(JSON.parse(raw));
+                }
             }
-            if (combined.length > 0) return combined;
         }
+        return combined;
     } catch {}
     return [];
 }
+
 function readChatDiskMirror<T>(key: string): T[] {
     if (typeof window === "undefined") return [];
     try {
@@ -153,7 +221,6 @@ function readChatDiskMirror<T>(key: string): T[] {
     } catch {}
     return [];
 }
-
 
 /**
  * Initialize IndexedDB and migrate data from localStorage if needed.
@@ -217,104 +284,13 @@ export async function initChatDb(): Promise<{
         // 优先检查原生磁盘保险箱：如果原生磁盘有真实的现代数据，直接用原生磁盘，严禁读取 localStorage 远古幽灵记录
         const diskSessions = readChatDiskMirror<ChatSession>(LS_SESSIONS_KEY);
         const diskContacts = readChatDiskMirror<ChatContact>(LS_CONTACTS_KEY);
-        const diskMessages = readMessagesDiskMirror();
-        if (diskSessions.length > 0 || diskContacts.length > 0) {
-            console.log("[ChatDB] Recovered from Native Vault instead of stale localStorage");
-            markMigrated();
-            try {
-                window.localStorage.removeItem(LS_MESSAGES_KEY);
-                window.localStorage.removeItem(LS_SESSIONS_KEY);
-                window.localStorage.removeItem(LS_CONTACTS_KEY);
-            } catch {}
-            if (diskMessages.length > 0) await chatDb.messages.bulkPut(diskMessages).catch(() => {});
-            if (diskSessions.length > 0) await chatDb.sessions.bulkPut(diskSessions).catch(() => {});
-            if (diskContacts.length > 0) await chatDb.contacts.bulkPut(diskContacts).catch(() => {});
-            return { messages: diskMessages, sessions: diskSessions, contacts: diskContacts };
-        }
-
-        // First run after migration: move localStorage data → IndexedDB
-        try {
-            const rawMessages = window.localStorage.getItem(LS_MESSAGES_KEY);
-            const rawSessions = window.localStorage.getItem(LS_SESSIONS_KEY);
-            const rawContacts = window.localStorage.getItem(LS_CONTACTS_KEY);
-
-            const lsMessages: ChatMessage[] = rawMessages ? JSON.parse(rawMessages) : [];
-            const lsSessions: ChatSession[] = rawSessions ? JSON.parse(rawSessions) : [];
-            const lsContacts: ChatContact[] = rawContacts ? JSON.parse(rawContacts) : [];
-
-            if (lsMessages.length > 0) {
-                await chatDb.messages.bulkPut(lsMessages);
-            }
-            if (lsSessions.length > 0) {
-                await chatDb.sessions.bulkPut(lsSessions);
-            }
-            if (lsContacts.length > 0) {
-                await chatDb.contacts.bulkPut(lsContacts);
-            }
-
-            // Mark as migrated and remove old localStorage data
-            window.localStorage.setItem(LS_MIGRATED_FLAG, "1");
-            window.localStorage.removeItem(LS_MESSAGES_KEY);
-            window.localStorage.removeItem(LS_SESSIONS_KEY);
-            window.localStorage.removeItem(LS_CONTACTS_KEY);
-
-            console.log(`[ChatDB] Migrated from localStorage: ${lsMessages.length} messages, ${lsSessions.length} sessions, ${lsContacts.length} contacts`);
-
-            return { messages: lsMessages, sessions: lsSessions, contacts: lsContacts };
-        } catch (err) {
-            console.error("[ChatDB] Migration failed, falling back to localStorage:", err);
-            // If migration fails, load from localStorage as fallback
-            const fallbackMessages: ChatMessage[] = safeParse(window.localStorage.getItem(LS_MESSAGES_KEY));
-            const fallbackSessions: ChatSession[] = safeParse(window.localStorage.getItem(LS_SESSIONS_KEY));
-            const fallbackContacts: ChatContact[] = safeParse(window.localStorage.getItem(LS_CONTACTS_KEY));
-            return { messages: fallbackMessages, sessions: fallbackSessions, contacts: fallbackContacts };
-        }
-    }
-
-    // Already migrated: load from IndexedDB (with retries)
-    const loaded = await loadFromIndexedDbWithRetries();
-    if (!loaded) {
-        throw new Error("[ChatDB] Failed to load after 3 attempts");
-    }
-    return loaded;
-}
-
-/** 写迁移标记；失败（如 localStorage 配额满）只是性能问题，不应升级成数据事故。 */
-function markMigrated(): void {
-    try {
-        window.localStorage.setItem(LS_MIGRATED_FLAG, "1");
-    } catch (err) {
-        console.warn("[ChatDB] Failed to persist migration flag:", err);
-    }
-}
-
-/** 从 IndexedDB 读取全部数据，失败重试最多 3 次；全部失败返回 null（由调用方决定是否抛错）。 */
-async function loadFromIndexedDbWithRetries(): Promise<{
-    messages: ChatMessage[];
-    sessions: ChatSession[];
-    contacts: ChatContact[];
-} | null> {
-    let lastErr: unknown;
-    for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-            const [loadedMessages, loadedSessions, loadedContacts] = await Promise.all([
-                chatDb.messages.toArray(),
-                chatDb.sessions.toArray(),
-                chatDb.contacts.toArray(),
-            ]);
-            let messages = loadedMessages;
-            let sessions = loadedSessions;
-            let contacts = loadedContacts;
-            const diskMessages = readMessagesDiskMirror();
-            if (diskMessages.length > 0) {
-                const existingMsgIds = new Set(messages.map(m => m.id));
-                const missingMsgs = diskMessages.filter(m => m && m.id && !existingMsgIds.has(m.id));
-                if (missingMsgs.length > 0) {
-                    messages = [...messages, ...missingMsgs];
-                    await chatDb.messages.bulkPut(missingMsgs).catch(() => {});
+        if (messages.length === 0) {
+                const diskMessages = readMessagesDiskMirror();
+                if (diskMessages.length > 0) {
+                    messages = diskMessages;
+                    await chatDb.messages.bulkPut(diskMessages).catch(() => {});
                 }
-            }
-            if (messages.length > 0) {
+            } else {
                 writeMessagesDiskMirror(messages);
             }
             if (sessions.length === 0) {
@@ -383,16 +359,18 @@ export async function dbBulkPutMessages(msgs: ChatMessage[]): Promise<void> {
 }
 
 export function dbDeleteMessage(id: string): void {
-    chatDb.messages.delete(id).catch(err => console.warn("[ChatDB] delete message failed:", err));
+    chatDb.messages.delete(id).then(() => scheduleMessagesDiskMirror()).catch(err => console.warn("[ChatDB] delete message failed:", err));
 }
 
 export function dbDeleteMessagesBySession(sessionId: string): void {
+    removeSessionDiskChunks(sessionId);
     chatDb.messages.where("sessionId").equals(sessionId).delete()
+        .then(() => scheduleMessagesDiskMirror())
         .catch(err => console.warn("[ChatDB] delete session messages failed:", err));
 }
 
 export function dbDeleteMessagesByIds(ids: string[]): void {
-    chatDb.messages.bulkDelete(ids).catch(err => console.warn("[ChatDB] bulkDelete messages failed:", err));
+    chatDb.messages.bulkDelete(ids).then(() => scheduleMessagesDiskMirror()).catch(err => console.warn("[ChatDB] bulkDelete messages failed:", err));
 }
 
 export function dbPutSession(session: ChatSession): void {
@@ -413,7 +391,8 @@ export function dbReplaceSessions(sessions: ChatSession[]): void {
 }
 
 export function dbDeleteSession(id: string): void {
-    chatDb.sessions.delete(id).catch(err => console.warn("[ChatDB] delete session failed:", err));
+    removeSessionDiskChunks(id);
+    chatDb.sessions.delete(id).then(() => chatDb.sessions.toArray().then(s => writeChatDiskMirror(LS_SESSIONS_KEY, s))).catch(err => console.warn("[ChatDB] delete session failed:", err));
 }
 
 export function dbPutContacts(contacts: ChatContact[]): void {

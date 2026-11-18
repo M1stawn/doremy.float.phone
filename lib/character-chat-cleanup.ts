@@ -57,7 +57,7 @@ export async function removeCharacterChatReferences(characterId: string): Promis
 
     const sessions = loadChatSessions();
     const privateSessionIds = sessions
-        .filter(session => !session.isGroup && session.contactId === characterId)
+        .filter(session => !session.isGroup && (session.contactId === characterId || session.characterId === characterId))
         .map(session => session.id);
     const nextSessions = sessions.map(session => removeCharacterFromGroupSession(session, characterId));
 
