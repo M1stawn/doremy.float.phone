@@ -207,7 +207,63 @@ function createThemeAssetId(type: ThemeAssetType): string {
   return `${type}_${uuid}`;
 }
 
+
+// ── Android 原生 filesDir 永久磁盘镜像（防止 WebView 清理缓存导致自定义字体、壁纸、素材丢失）──
+type NativeVaultBridge = {
+  saveLocalDiskData?: (key: string, content: string) => boolean;
+  loadLocalDiskData?: (key: string) => string;
+  removeLocalDiskData?: (key: string) => boolean;
+};
+
+function getNativeVaultBridge(): NativeVaultBridge | null {
+  if (typeof window === "undefined") return null;
+  const w = window as unknown as { AndroidShell?: NativeVaultBridge };
+  return w.AndroidShell ?? null;
+}
+
+function writeAssetDiskMirror(record: ThemeAssetRecord): void {
+  if (typeof window === "undefined" || !record?.id || !record?.dataUrl) return;
+  try {
+    const bridge = getNativeVaultBridge();
+    if (bridge && typeof bridge.saveLocalDiskData === "function") {
+      const raw = JSON.stringify(record);
+      // 字体/高清壁纸可能较大，只要在 6MB 限制内均落盘原生硬盘
+      if (raw.length <= 6_000_000) {
+        bridge.saveLocalDiskData("theme_asset_" + record.id, raw);
+      }
+    }
+  } catch {}
+}
+
+function readAssetDiskMirror(id: string): ThemeAssetRecord | null {
+  if (typeof window === "undefined" || !id) return null;
+  try {
+    const bridge = getNativeVaultBridge();
+    if (bridge && typeof bridge.loadLocalDiskData === "function") {
+      const raw = bridge.loadLocalDiskData("theme_asset_" + id);
+      if (raw && raw.trim().length > 10) {
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.id === id && parsed.dataUrl) {
+          return parsed as ThemeAssetRecord;
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function removeAssetDiskMirror(id: string): void {
+  if (typeof window === "undefined" || !id) return;
+  try {
+    const bridge = getNativeVaultBridge();
+    if (bridge && typeof bridge.removeLocalDiskData === "function") {
+      bridge.removeLocalDiskData("theme_asset_" + id);
+    }
+  } catch {}
+}
+
 async function saveAssetRecord(record: ThemeAssetRecord): Promise<void> {
+  writeAssetDiskMirror(record);
   const database = await openThemeDb();
   if (!database) {
     return;
@@ -225,19 +281,27 @@ async function saveAssetRecord(record: ThemeAssetRecord): Promise<void> {
 
 async function readAssetRecord(id: string): Promise<ThemeAssetRecord | null> {
   const database = await openThemeDb();
-  if (!database) {
-    return null;
+  if (database) {
+    try {
+      const transaction = database.transaction(THEME_ASSET_STORE, "readonly");
+      const store = transaction.objectStore(THEME_ASSET_STORE);
+      const result = await runRequest(store.get(id));
+      await runTransactionDone(transaction);
+      if (result) {
+        const rec = result as ThemeAssetRecord;
+        writeAssetDiskMirror(rec);
+        return rec;
+      }
+    } catch {} finally {
+      database.close();
+    }
   }
-
-  try {
-    const transaction = database.transaction(THEME_ASSET_STORE, "readonly");
-    const store = transaction.objectStore(THEME_ASSET_STORE);
-    const result = await runRequest(store.get(id));
-    await runTransactionDone(transaction);
-    return (result as ThemeAssetRecord | undefined) ?? null;
-  } finally {
-    database.close();
+  const diskRec = readAssetDiskMirror(id);
+  if (diskRec) {
+    void saveAssetRecord(diskRec).catch(() => {});
+    return diskRec;
   }
+  return null;
 }
 
 export async function getThemeAssetDataUrl(id: string): Promise<string | null> {
@@ -284,6 +348,7 @@ export async function writeThemeAssetRecords(records: ThemeAssetRecord[]): Promi
 }
 
 export async function deleteThemeAsset(id: string): Promise<void> {
+  removeAssetDiskMirror(id);
   // 本地主题预设只保存资源引用；只要仍有预设使用该资源，就不能物理删除，
   // 否则用户切回预设时会出现壁纸、图标或字体丢失。
   if (themePresetUsesAsset(id)) {
