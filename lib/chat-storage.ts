@@ -1140,9 +1140,6 @@ function restoreContactsForPrivateSessions(contacts: ChatContact[], sessions: Ch
     if (privateSessionsWithMessages.length === 0 || contacts.length >= privateSessionsWithMessages.length) {
         return { items: contacts, changed: false };
     }
-    if (contacts.length > 0 && contacts.length > Math.floor(privateSessionsWithMessages.length / 2)) {
-        return { items: contacts, changed: false };
-    }
 
     const contactIds = new Set(contacts.map(contact => contact.characterId));
     const restored: ChatContact[] = [...contacts];
@@ -1327,6 +1324,85 @@ function normalizeLegacyTextToolHistory(messages: ChatMessage[]): {
     };
 }
 
+
+function recoverOrphanSessionsFromMessages(
+    sessions: ChatSession[],
+    contacts: ChatContact[],
+    messages: ChatMessage[],
+): { sessions: ChatSession[]; changed: boolean } {
+    const sessionIds = new Set(sessions.map(s => s.id));
+    const removedByUser = loadRemovedContactIds();
+    const characters = loadCharacters();
+    const characterIds = new Set(characters.map(c => c.id));
+    const contactById = new Map(contacts.map(c => [c.id, c]));
+    const orphanBySession = new Map<string, ChatMessage[]>();
+
+    for (const msg of messages) {
+        if (!msg || !msg.sessionId || sessionIds.has(msg.sessionId)) continue;
+        const list = orphanBySession.get(msg.sessionId) || [];
+        list.push(msg);
+        orphanBySession.set(msg.sessionId, list);
+    }
+
+    if (orphanBySession.size === 0) return { sessions, changed: false };
+
+    const nextSessions = [...sessions];
+    let changed = false;
+
+    for (const [orphanSessionId, msgs] of orphanBySession.entries()) {
+        let inferredCharId: string | null = null;
+        for (const m of msgs) {
+            if (m.senderCharacterId && characterIds.has(m.senderCharacterId)) {
+                inferredCharId = m.senderCharacterId;
+                break;
+            }
+        }
+        if (!inferredCharId && characterIds.has(orphanSessionId)) {
+            inferredCharId = orphanSessionId;
+        }
+        if (!inferredCharId && contactById.has(orphanSessionId)) {
+            inferredCharId = contactById.get(orphanSessionId)?.characterId || null;
+        }
+        if (inferredCharId && removedByUser.has(inferredCharId)) continue;
+
+        const existingSessionIdx = inferredCharId
+            ? nextSessions.findIndex(s => !s.isGroup && (s.characterId === inferredCharId || s.contactId === inferredCharId))
+            : -1;
+
+        if (existingSessionIdx !== -1) {
+            const targetSessionId = nextSessions[existingSessionIdx].id;
+            const moved: ChatMessage[] = [];
+            _messagesCache = _messagesCache.map(m => {
+                if (m.sessionId !== orphanSessionId) return m;
+                const updated = { ...m, sessionId: targetSessionId };
+                moved.push(updated);
+                return updated;
+            });
+            if (moved.length > 0) dbPutMessages(moved);
+            changed = true;
+        } else if (inferredCharId) {
+            const matchedContact = contacts.find(c => c.characterId === inferredCharId);
+            const lastMsg = msgs[msgs.length - 1];
+            nextSessions.push({
+                id: orphanSessionId,
+                contactId: matchedContact ? matchedContact.id : inferredCharId,
+                characterId: inferredCharId,
+                lastMessageId: lastMsg?.id,
+                lastMessagePreview: lastMsg?.content?.slice(0, 60) || "",
+                unreadCount: 0,
+                updatedAt: lastMsg?.createdAt || new Date().toISOString(),
+                isPinned: false,
+                bilingualTranslationEnabled: true,
+                collapseBilingualTranslation: true,
+            });
+            sessionIds.add(orphanSessionId);
+            changed = true;
+        }
+    }
+
+    return { sessions: nextSessions, changed };
+}
+
 function refreshSessionPreviewMetadata(sessions: ChatSession[]): NormalizedList<ChatSession> {
     let changed = false;
     const items = sessions.map(session => {
@@ -1370,14 +1446,15 @@ export function hydrateChatStorage(): Promise<void> {
         // Session normalization must see the freshly hydrated contact→character map;
         // otherwise legacy contact_ sessions cannot be canonicalized on first load.
         _contactsCache = normalizedContacts.items;
-        const normalizedSessions = normalizeChatSessions(data.sessions);
+        const orphanRecovered = recoverOrphanSessionsFromMessages(data.sessions, normalizedContacts.items, _messagesCache);
+        const normalizedSessions = normalizeChatSessions(orphanRecovered.sessions);
         const redirectedMessages = redirectMessagesToPreferredSessions(normalizedSessions.redirects);
         const refreshedSessions = refreshSessionPreviewMetadata(normalizedSessions.items);
         normalizedContacts = restoreContactsForPrivateSessions(normalizedContacts.items, normalizedSessions.items);
         _contactsCache = normalizedContacts.items;
         _sessionsCache = refreshedSessions.items;
         if (normalizedContacts.changed) dbReplaceContacts(normalizedContacts.items);
-        if (normalizedSessions.changed || redirectedMessages > 0 || refreshedSessions.changed) dbReplaceSessions(refreshedSessions.items);
+        if (orphanRecovered.changed || normalizedSessions.changed || redirectedMessages > 0 || refreshedSessions.changed) dbReplaceSessions(refreshedSessions.items);
         _hydrated = true;
 
         const identityMappings = normalizedContacts.items

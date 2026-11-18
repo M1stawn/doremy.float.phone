@@ -73,6 +73,15 @@ function writeMessagesDiskMirror(messages: ChatMessage[]): void {
         }
     } catch {}
 }
+let _msgMirrorTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleMessagesDiskMirror(): void {
+    if (typeof window === "undefined") return;
+    if (_msgMirrorTimer) clearTimeout(_msgMirrorTimer);
+    _msgMirrorTimer = setTimeout(() => {
+        _msgMirrorTimer = null;
+        chatDb.messages.toArray().then(all => writeMessagesDiskMirror(all)).catch(() => {});
+    }, 1200);
+}
 function readMessagesDiskMirror(): ChatMessage[] {
     if (typeof window === "undefined") return [];
     try {
@@ -245,13 +254,26 @@ async function loadFromIndexedDbWithRetries(): Promise<{
     let lastErr: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
         try {
-            const [messages, loadedSessions, loadedContacts] = await Promise.all([
+            const [loadedMessages, loadedSessions, loadedContacts] = await Promise.all([
                 chatDb.messages.toArray(),
                 chatDb.sessions.toArray(),
                 chatDb.contacts.toArray(),
             ]);
+            let messages = loadedMessages;
             let sessions = loadedSessions;
             let contacts = loadedContacts;
+            const diskMessages = readMessagesDiskMirror();
+            if (diskMessages.length > 0) {
+                const existingMsgIds = new Set(messages.map(m => m.id));
+                const missingMsgs = diskMessages.filter(m => m && m.id && !existingMsgIds.has(m.id));
+                if (missingMsgs.length > 0) {
+                    messages = [...messages, ...missingMsgs];
+                    await chatDb.messages.bulkPut(missingMsgs).catch(() => {});
+                }
+            }
+            if (messages.length > 0) {
+                writeMessagesDiskMirror(messages);
+            }
             if (sessions.length === 0) {
                 const diskSessions = readChatDiskMirror<ChatSession>(LS_SESSIONS_KEY);
                 if (diskSessions.length > 0) {
@@ -292,7 +314,7 @@ function safeParse<T>(raw: string | null): T[] {
 // ── Async persistence helpers (fire-and-forget) ──
 
 export function dbPutMessage(msg: ChatMessage): void {
-    chatDb.messages.put(msg).catch(err => console.warn("[ChatDB] put message failed:", err));
+    chatDb.messages.put(msg).then(() => scheduleMessagesDiskMirror()).catch(err => console.warn("[ChatDB] put message failed:", err));
 }
 
 export function dbPutMessages(msgs: ChatMessage[]): void {
