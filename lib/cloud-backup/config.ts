@@ -31,7 +31,7 @@ export const DEFAULT_CLOUD_BACKUP_CONFIG: CloudBackupConfig = {
   enabled: false,
   intervalHours: 6,
   keepCount: 3,
-  excludeMedia: true,
+  excludeMedia: false,
 };
 
 /** Strip trailing slashes; tolerate a pasted URL with or without protocol. */
@@ -52,7 +52,7 @@ export function loadCloudBackupConfig(): CloudBackupConfig {
       enabled: Boolean(parsed.enabled),
       intervalHours: clampInterval(parsed.intervalHours),
       keepCount: clampKeepCount(parsed.keepCount),
-      excludeMedia: parsed.excludeMedia !== false,
+      excludeMedia: Boolean(parsed.excludeMedia),
       managedProjectRef: typeof parsed.managedProjectRef === "string" ? parsed.managedProjectRef : undefined,
       managedOrganizationSlug: typeof parsed.managedOrganizationSlug === "string" ? parsed.managedOrganizationSlug : undefined,
     };
@@ -68,7 +68,7 @@ export function saveCloudBackupConfig(config: CloudBackupConfig): void {
     key: (config.key || "").trim(),
     intervalHours: clampInterval(config.intervalHours),
     keepCount: clampKeepCount(config.keepCount),
-    excludeMedia: config.excludeMedia !== false,
+    excludeMedia: Boolean(config.excludeMedia),
   }));
 }
 

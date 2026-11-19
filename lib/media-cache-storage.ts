@@ -31,6 +31,104 @@ function getDb(): MediaCacheDatabase {
     return db;
 }
 
+// ── Android 原生 filesDir 永久磁盘媒体镜像（防止 WebView 清理缓存丢失聊天照片、照片墙与表情）──
+
+type NativeVaultBridge = {
+    saveLocalDiskData?: (key: string, content: string) => boolean;
+    loadLocalDiskData?: (key: string) => string;
+    removeLocalDiskData?: (key: string) => boolean;
+};
+
+function getNativeVaultBridge(): NativeVaultBridge | null {
+    if (typeof window === "undefined") return null;
+    const w = window as unknown as { AndroidShell?: NativeVaultBridge };
+    return w.AndroidShell ?? null;
+}
+
+const MAX_MEDIA_DISK_CHARS = 5_500_000;
+
+function blobToBase64String(blob: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(reader.error);
+        reader.onload = () => {
+            const res = String(reader.result ?? "");
+            const comma = res.indexOf(",");
+            resolve(comma >= 0 ? res.slice(comma + 1) : res);
+        };
+        reader.readAsDataURL(blob);
+    });
+}
+
+function base64ToBlob(b64: string, mimeType: string): Blob {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: mimeType || "application/octet-stream" });
+}
+
+async function writeMediaEntryToDisk(entry: MediaCacheEntry): Promise<void> {
+    if (typeof window === "undefined" || !entry?.id || !entry?.blob) return;
+    if (entry.blob.size > 4_000_000) return;
+    try {
+        const bridge = getNativeVaultBridge();
+        if (!bridge || typeof bridge.saveLocalDiskData !== "function") return;
+        const b64 = await blobToBase64String(entry.blob);
+        const payload = JSON.stringify({
+            id: entry.id,
+            b64,
+            mimeType: entry.mimeType,
+            mediaCategory: entry.mediaCategory,
+            createdAt: entry.createdAt,
+            retainedBy: entry.retainedBy,
+        });
+        if (payload.length <= MAX_MEDIA_DISK_CHARS) {
+            bridge.saveLocalDiskData("media_blob_" + entry.id, payload);
+        }
+    } catch {}
+}
+
+function readMediaEntryFromDisk(id: string): MediaCacheEntry | null {
+    if (typeof window === "undefined" || !id) return null;
+    try {
+        const bridge = getNativeVaultBridge();
+        if (!bridge || typeof bridge.loadLocalDiskData !== "function") return null;
+        const raw = bridge.loadLocalDiskData("media_blob_" + id);
+        if (!raw || raw.trim().length < 10) return null;
+        const parsed = JSON.parse(raw) as {
+            id?: string;
+            b64?: string;
+            mimeType?: string;
+            mediaCategory?: MediaCacheEntry["mediaCategory"];
+            createdAt?: number;
+            retainedBy?: string[];
+        };
+        if (!parsed || typeof parsed.b64 !== "string" || !parsed.b64) return null;
+        const mimeType = parsed.mimeType || "image/png";
+        const blob = base64ToBlob(parsed.b64, mimeType);
+        return {
+            id: parsed.id || id,
+            blob,
+            mimeType,
+            mediaCategory: parsed.mediaCategory || "image",
+            createdAt: typeof parsed.createdAt === "number" ? parsed.createdAt : Date.now(),
+            retainedBy: Array.isArray(parsed.retainedBy) ? parsed.retainedBy : undefined,
+        };
+    } catch {
+        return null;
+    }
+}
+
+function removeMediaEntryFromDisk(id: string): void {
+    if (typeof window === "undefined" || !id) return;
+    try {
+        const bridge = getNativeVaultBridge();
+        if (bridge && typeof bridge.removeLocalDiskData === "function") {
+            bridge.removeLocalDiskData("media_blob_" + id);
+        }
+    } catch {}
+}
+
 // ── MIME Sniffing ────────────────────────────────
 
 const MAGIC_SIGNATURES: Array<{ prefix: string; mime: string; category: MediaCacheEntry["mediaCategory"] }> = [
@@ -94,7 +192,9 @@ function generateId(): string {
 
 export async function storeMediaBlob(blob: Blob, mimeType: string, category: MediaCacheEntry["mediaCategory"]): Promise<string> {
     const id = generateId();
-    await getDb().entries.put({ id, blob, mimeType, mediaCategory: category, createdAt: Date.now() });
+    const entry: MediaCacheEntry = { id, blob, mimeType, mediaCategory: category, createdAt: Date.now() };
+    await getDb().entries.put(entry);
+    void writeMediaEntryToDisk(entry);
     return `${MEDIA_STORE_PROTOCOL}${id}`;
 }
 
@@ -111,8 +211,16 @@ export async function storeMediaBase64(b64: string, declaredMime?: string): Prom
 export async function loadMediaBlob(ref: string): Promise<{ blob: Blob; mimeType: string; category: MediaCacheEntry["mediaCategory"] } | null> {
     const id = ref.startsWith(MEDIA_STORE_PROTOCOL) ? ref.slice(MEDIA_STORE_PROTOCOL.length) : ref;
     const entry = await getDb().entries.get(id);
-    if (!entry) return null;
-    return { blob: entry.blob, mimeType: entry.mimeType, category: entry.mediaCategory };
+    if (entry) {
+        void writeMediaEntryToDisk(entry);
+        return { blob: entry.blob, mimeType: entry.mimeType, category: entry.mediaCategory };
+    }
+    const diskEntry = readMediaEntryFromDisk(id);
+    if (diskEntry) {
+        await getDb().entries.put(diskEntry).catch(() => {});
+        return { blob: diskEntry.blob, mimeType: diskEntry.mimeType, category: diskEntry.mediaCategory };
+    }
+    return null;
 }
 
 /** Keep a media ref alive while a persistent feature references it. */
@@ -120,9 +228,18 @@ export async function retainMediaRef(ref: string | undefined, owner: string): Pr
     if (!ref || !ref.startsWith(MEDIA_STORE_PROTOCOL) || !owner.trim()) return;
     const table = getDb().entries;
     const id = ref.slice(MEDIA_STORE_PROTOCOL.length);
-    const entry = await table.get(id);
+    let entry = await table.get(id);
+    if (!entry) {
+        const diskEntry = readMediaEntryFromDisk(id);
+        if (diskEntry) {
+            await table.put(diskEntry).catch(() => {});
+            entry = diskEntry;
+        }
+    }
     if (!entry) throw new Error("媒体文件不存在，无法建立引用保护");
-    await table.update(id, { retainedBy: Array.from(new Set([...(entry.retainedBy ?? []), owner.trim()])) });
+    const retainedBy = Array.from(new Set([...(entry.retainedBy ?? []), owner.trim()]));
+    await table.update(id, { retainedBy });
+    void writeMediaEntryToDisk({ ...entry, retainedBy });
 }
 
 /** Release one feature's reference. Deletion remains an explicit separate operation. */
@@ -132,7 +249,9 @@ export async function releaseMediaRef(ref: string | undefined, owner: string): P
     const id = ref.slice(MEDIA_STORE_PROTOCOL.length);
     const entry = await table.get(id);
     if (!entry) return;
-    await table.update(id, { retainedBy: (entry.retainedBy ?? []).filter(value => value !== owner.trim()) });
+    const retainedBy = (entry.retainedBy ?? []).filter(value => value !== owner.trim());
+    await table.update(id, { retainedBy });
+    void writeMediaEntryToDisk({ ...entry, retainedBy });
 }
 
 export async function isMediaRefRetained(ref: string | undefined): Promise<boolean> {
@@ -146,14 +265,13 @@ export async function deleteMediaRef(ref: string | undefined): Promise<void> {
     const table = getDb().entries;
     const id = ref.slice(MEDIA_STORE_PROTOCOL.length);
     const entry = await table.get(id);
-    // Old photo-wall backgrounds predate retainedBy, so check the persistent source of truth too.
-    // This keeps a background safe even if the photo-wall screen has not been opened since upgrade.
     let referencedByPhotoWall = false;
     try {
         const state = loadPhotoWallState();
         referencedByPhotoWall = state.wallBackgroundRef === ref || state.photos.some(photo => photo.mediaRef === ref);
-    } catch { /* If a damaged storage record cannot be read, still honor explicit retention metadata. */ }
+    } catch { /* ignore */ }
     if (entry?.retainedBy?.length || referencedByPhotoWall) return;
+    removeMediaEntryFromDisk(id);
     await table.delete(id);
 }
 
