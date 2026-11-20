@@ -1,9 +1,21 @@
 // lib/chat-db.ts
 // IndexedDB persistence layer for chat data using Dexie.js.
-// Provides async persistence behind the synchronous in-memory cache in chat-storage.ts.
+// Provides async persistence behind the synchronous in-memory cache in chat-storage.ts,
+// backed by incremental per-session Android native disk vault mirroring.
 
 import Dexie from "dexie";
 import type { ChatMessage, ChatSession, ChatContact } from "./chat-storage";
+import {
+    VAULT_KEYS,
+    getNativeVaultBridge,
+    hasNativeVault,
+    vaultHasKey,
+    vaultListLogicalKeys,
+    vaultReadJson,
+    vaultRemove,
+    vaultRemovePhysicalByPrefix,
+    vaultWriteJson,
+} from "./native-vault";
 
 // ── Database Schema ──────────────────────────────
 
@@ -31,191 +43,188 @@ const LS_SESSIONS_KEY = "ai_phone_chat_sessions_v1";
 const LS_CONTACTS_KEY = "ai_phone_chat_contacts_v1";
 const LS_MIGRATED_FLAG = "ai_phone_idb_migrated_v1";
 
-// ── Android 原生 filesDir 分片灾备镜像（支持 49MB+ 超长会话分片保存，仅在整库被系统清空时恢复，绝不复活已删数据）──
-type NativeVaultBridge = {
-    saveLocalDiskData?: (key: string, content: string) => boolean;
-    loadLocalDiskData?: (key: string) => string;
-    removeLocalDiskData?: (key: string) => boolean;
-    listLocalDiskKeys?: () => string;
-};
+// ── 按会话增量落盘到 Android 原生 filesDir（单会话独立分片，绝不全库重写，主动删除即时同步）──
 
-function getNativeVaultBridge(): NativeVaultBridge | null {
-    if (typeof window === "undefined") return null;
-    const w = window as unknown as { AndroidShell?: NativeVaultBridge };
-    return w.AndroidShell ?? null;
+const _sessionMirrorTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function sessionVaultKey(sessionId: string): string {
+    return `${VAULT_KEYS.CHAT_SESSION_PREFIX}${sessionId}`;
 }
 
-const MAX_CHUNK_CHARS = 3_500_000;
-
-function writeChatDiskMirror<T>(key: string, items: T[]): void {
-    if (typeof window === "undefined") return;
-    try {
-        const bridge = getNativeVaultBridge();
-        if (bridge && typeof bridge.saveLocalDiskData === "function") {
-            const raw = JSON.stringify(items);
-            if (raw.length <= 6_000_000) bridge.saveLocalDiskData(key, raw);
-        }
-    } catch {}
+function removeLegacySessionDiskFiles(sessionId: string): void {
+    if (!sessionId) return;
+    vaultRemove(`${VAULT_KEYS.LEGACY_CHAT_META_PREFIX}${sessionId}`);
+    vaultRemovePhysicalByPrefix(`${VAULT_KEYS.LEGACY_CHAT_SESS_PREFIX}${sessionId}`);
 }
 
-function readChatDiskMirror<T>(key: string): T[] {
-    if (typeof window === "undefined") return [];
-    try {
-        const bridge = getNativeVaultBridge();
-        if (bridge && typeof bridge.loadLocalDiskData === "function") {
-            const raw = bridge.loadLocalDiskData(key);
-            if (raw && raw.trim().length > 2) {
-                const parsed = JSON.parse(raw);
-                if (Array.isArray(parsed)) return parsed as T[];
-            }
-        }
-    } catch {}
-    return [];
+function removeSessionDiskMirror(sessionId: string): void {
+    if (!sessionId) return;
+    const pending = _sessionMirrorTimers.get(sessionId);
+    if (pending) {
+        clearTimeout(pending);
+        _sessionMirrorTimers.delete(sessionId);
+    }
+    vaultRemove(sessionVaultKey(sessionId));
+    removeLegacySessionDiskFiles(sessionId);
 }
 
-function removeSessionDiskChunks(sessionId: string): void {
-    if (typeof window === "undefined" || !sessionId) return;
-    try {
-        const bridge = getNativeVaultBridge();
-        if (!bridge || typeof bridge.removeLocalDiskData !== "function") return;
-        bridge.removeLocalDiskData("msg_sess_" + sessionId);
-        if (typeof bridge.loadLocalDiskData === "function") {
-            const metaRaw = bridge.loadLocalDiskData("msg_meta_" + sessionId);
-            if (metaRaw) {
-                try {
-                    const meta = JSON.parse(metaRaw) as { chunks?: number };
-                    const count = Number(meta?.chunks || 0);
-                    for (let i = 0; i < count; i++) {
-                        bridge.removeLocalDiskData("msg_sess_" + sessionId + "_p" + i);
-                    }
-                } catch {}
-            }
-        }
-        bridge.removeLocalDiskData("msg_meta_" + sessionId);
-    } catch {}
+function writeSingleSessionMirror(sessionId: string, list: ChatMessage[]): void {
+    if (!sessionId || !hasNativeVault()) return;
+    if (!list || list.length === 0) {
+        removeSessionDiskMirror(sessionId);
+        return;
+    }
+    vaultWriteJson(sessionVaultKey(sessionId), list);
+    removeLegacySessionDiskFiles(sessionId);
 }
 
-function writeSingleSessionDiskMirror(sessionId: string, list: ChatMessage[]): void {
-    if (typeof window === "undefined" || !sessionId) return;
+async function flushSessionDiskMirrorNow(sessionId: string): Promise<void> {
+    if (!sessionId || !hasNativeVault()) return;
+    const pending = _sessionMirrorTimers.get(sessionId);
+    if (pending) {
+        clearTimeout(pending);
+        _sessionMirrorTimers.delete(sessionId);
+    }
     try {
-        const bridge = getNativeVaultBridge();
-        if (!bridge || typeof bridge.saveLocalDiskData !== "function") return;
-        if (!list || list.length === 0) {
-            removeSessionDiskChunks(sessionId);
-            return;
-        }
-        const chunks: string[] = [];
-        let currentBatch: ChatMessage[] = [];
-        let currentLen = 2;
-        for (const msg of list) {
-            const itemStr = JSON.stringify(msg);
-            if (currentBatch.length > 0 && currentLen + itemStr.length + 1 > MAX_CHUNK_CHARS) {
-                chunks.push(JSON.stringify(currentBatch));
-                currentBatch = [msg];
-                currentLen = 2 + itemStr.length;
-            } else {
-                currentBatch.push(msg);
-                currentLen += itemStr.length + 1;
-            }
-        }
-        if (currentBatch.length > 0) chunks.push(JSON.stringify(currentBatch));
-        for (let i = 0; i < chunks.length; i++) {
-            bridge.saveLocalDiskData("msg_sess_" + sessionId + "_p" + i, chunks[i]);
-        }
-        bridge.saveLocalDiskData("msg_meta_" + sessionId, JSON.stringify({ chunks: chunks.length, updatedAt: Date.now() }));
-        if (typeof bridge.removeLocalDiskData === "function") {
-            bridge.removeLocalDiskData("msg_sess_" + sessionId);
-        }
-    } catch {}
+        const list = await chatDb.messages.where("sessionId").equals(sessionId).toArray();
+        writeSingleSessionMirror(sessionId, list);
+    } catch {
+        // ignore
+    }
 }
 
-function writeMessagesDiskMirror(messages: ChatMessage[]): void {
-    if (typeof window === "undefined" || !messages) return;
-    try {
-        const bridge = getNativeVaultBridge();
-        if (!bridge || typeof bridge.saveLocalDiskData !== "function") return;
-        const bySession = new Map<string, ChatMessage[]>();
-        for (const m of messages) {
-            if (!m || !m.sessionId) continue;
-            const arr = bySession.get(m.sessionId) || [];
-            arr.push(m);
-            bySession.set(m.sessionId, arr);
-        }
-        for (const [sessId, list] of bySession.entries()) {
-            writeSingleSessionDiskMirror(sessId, list);
-        }
-        if (typeof bridge.listLocalDiskKeys === "function" && typeof bridge.removeLocalDiskData === "function") {
-            try {
-                const keys = JSON.parse(bridge.listLocalDiskKeys() || "[]") as string[];
-                for (const k of keys) {
-                    if (k.startsWith("msg_meta_")) {
-                        const sid = k.slice("msg_meta_".length);
-                        if (!bySession.has(sid)) removeSessionDiskChunks(sid);
-                    } else if (k.startsWith("msg_sess_") && !k.includes("_p")) {
-                        const sid = k.slice("msg_sess_".length);
-                        if (!bySession.has(sid)) bridge.removeLocalDiskData(k);
-                    }
+function scheduleSessionDiskMirror(sessionId: string): void {
+    if (!sessionId || !hasNativeVault()) return;
+    const prev = _sessionMirrorTimers.get(sessionId);
+    if (prev) clearTimeout(prev);
+    const timer = setTimeout(() => {
+        _sessionMirrorTimers.delete(sessionId);
+        void flushSessionDiskMirrorNow(sessionId);
+    }, 600);
+    _sessionMirrorTimers.set(sessionId, timer);
+}
+
+function syncAllSessionsListToVault(): void {
+    if (!hasNativeVault()) return;
+    void chatDb.sessions.toArray()
+        .then((all) => { vaultWriteJson(VAULT_KEYS.CHAT_SESSIONS, all); })
+        .catch(() => {});
+}
+
+function syncAllContactsListToVault(): void {
+    if (!hasNativeVault()) return;
+    void chatDb.contacts.toArray()
+        .then((all) => { vaultWriteJson(VAULT_KEYS.CHAT_CONTACTS, all); })
+        .catch(() => {});
+}
+
+function readLegacyMessagesFromDisk(): ChatMessage[] {
+    const bridge = getNativeVaultBridge();
+    if (!bridge?.loadLocalDiskData || !bridge.listLocalDiskKeys) return [];
+    const combined: ChatMessage[] = [];
+    const seenIds = new Set<string>();
+    const addMsgs = (arr: unknown) => {
+        if (!Array.isArray(arr)) return;
+        for (const item of arr) {
+            if (item && typeof item === "object" && "id" in item && typeof (item as ChatMessage).id === "string") {
+                const msg = item as ChatMessage;
+                if (!seenIds.has(msg.id)) {
+                    seenIds.add(msg.id);
+                    combined.push(msg);
                 }
-            } catch {}
+            }
         }
-        if (typeof bridge.removeLocalDiskData === "function") {
-            bridge.removeLocalDiskData(LS_MESSAGES_KEY);
+    };
+    try {
+        const keys = JSON.parse(bridge.listLocalDiskKeys() || "[]");
+        if (!Array.isArray(keys)) return [];
+        for (const k of keys) {
+            if (typeof k !== "string") continue;
+            if (k.startsWith(VAULT_KEYS.LEGACY_CHAT_META_PREFIX)) {
+                const sid = k.slice(VAULT_KEYS.LEGACY_CHAT_META_PREFIX.length);
+                const metaRaw = bridge.loadLocalDiskData(k);
+                if (!metaRaw) continue;
+                const meta = JSON.parse(metaRaw) as { chunks?: number };
+                const count = Number(meta?.chunks || 0);
+                for (let i = 0; i < count; i += 1) {
+                    const chunkRaw = bridge.loadLocalDiskData(`${VAULT_KEYS.LEGACY_CHAT_SESS_PREFIX}${sid}_p${i}`);
+                    if (chunkRaw) addMsgs(JSON.parse(chunkRaw));
+                }
+            } else if (k.startsWith(VAULT_KEYS.LEGACY_CHAT_SESS_PREFIX) && !k.includes("_p")) {
+                const raw = bridge.loadLocalDiskData(k);
+                if (raw) addMsgs(JSON.parse(raw));
+            }
         }
-    } catch {}
-}
-
-let _msgMirrorTimer: ReturnType<typeof setTimeout> | null = null;
-function scheduleMessagesDiskMirror(): void {
-    if (typeof window === "undefined") return;
-    if (_msgMirrorTimer) clearTimeout(_msgMirrorTimer);
-    _msgMirrorTimer = setTimeout(() => {
-        _msgMirrorTimer = null;
-        chatDb.messages.toArray().then(all => writeMessagesDiskMirror(all)).catch(() => {});
-    }, 1500);
+    } catch {
+        // ignore
+    }
+    return combined;
 }
 
 function readMessagesDiskMirror(): ChatMessage[] {
-    if (typeof window === "undefined") return [];
-    try {
-        const bridge = getNativeVaultBridge();
-        if (!bridge || typeof bridge.loadLocalDiskData !== "function") return [];
-        const combined: ChatMessage[] = [];
-        const seenIds = new Set<string>();
-        const addMsgs = (arr: unknown) => {
-            if (!Array.isArray(arr)) return;
-            for (const m of arr) {
-                if (m && typeof m === "object" && "id" in m && typeof (m as ChatMessage).id === "string") {
-                    const msg = m as ChatMessage;
-                    if (!seenIds.has(msg.id)) {
-                        seenIds.add(msg.id);
-                        combined.push(msg);
-                    }
-                }
-            }
-        };
-        if (typeof bridge.listLocalDiskKeys === "function") {
-            const keys = JSON.parse(bridge.listLocalDiskKeys() || "[]") as string[];
-            for (const k of keys) {
-                if (k.startsWith("msg_meta_")) {
-                    const sid = k.slice("msg_meta_".length);
-                    const metaRaw = bridge.loadLocalDiskData(k);
-                    if (metaRaw) {
-                        const meta = JSON.parse(metaRaw) as { chunks?: number };
-                        const count = Number(meta?.chunks || 0);
-                        for (let i = 0; i < count; i++) {
-                            const chunkRaw = bridge.loadLocalDiskData("msg_sess_" + sid + "_p" + i);
-                            if (chunkRaw) addMsgs(JSON.parse(chunkRaw));
-                        }
-                    }
-                } else if (k.startsWith("msg_sess_") && !k.includes("_p")) {
-                    const raw = bridge.loadLocalDiskData(k);
-                    if (raw) addMsgs(JSON.parse(raw));
-                }
+    if (!hasNativeVault()) return [];
+    const combined: ChatMessage[] = [];
+    const seenIds = new Set<string>();
+    const append = (arr: ChatMessage[] | null) => {
+        if (!Array.isArray(arr)) return;
+        for (const msg of arr) {
+            if (msg && typeof msg.id === "string" && !seenIds.has(msg.id)) {
+                seenIds.add(msg.id);
+                combined.push(msg);
             }
         }
-        return combined;
-    } catch {}
-    return [];
+    };
+
+    const newKeys = vaultListLogicalKeys(VAULT_KEYS.CHAT_SESSION_PREFIX);
+    for (const k of newKeys) {
+        append(vaultReadJson<ChatMessage[]>(k));
+    }
+
+    // 兼容历史旧版分片（msg_meta_ / msg_sess_），避免老用户升级后首轮灾备读不到旧档
+    if (combined.length === 0) {
+        append(readLegacyMessagesFromDisk());
+    }
+    return combined;
+}
+
+/** 仅当原生盘尚无新版镜像（如首次升级或刚导入备份清旧后）时，在后台按会话逐个补齐镜像。 */
+function backfillChatVaultIfMissing(
+    messages: ChatMessage[],
+    sessions: ChatSession[],
+    contacts: ChatContact[],
+): void {
+    if (!hasNativeVault()) return;
+    if (!vaultHasKey(VAULT_KEYS.CHAT_SESSIONS) && sessions.length > 0) {
+        vaultWriteJson(VAULT_KEYS.CHAT_SESSIONS, sessions);
+    }
+    if (!vaultHasKey(VAULT_KEYS.CHAT_CONTACTS) && contacts.length > 0) {
+        vaultWriteJson(VAULT_KEYS.CHAT_CONTACTS, contacts);
+    }
+    if (messages.length === 0) return;
+
+    const bySession = new Map<string, ChatMessage[]>();
+    for (const m of messages) {
+        if (!m || !m.sessionId) continue;
+        if (vaultHasKey(sessionVaultKey(m.sessionId))) continue;
+        const arr = bySession.get(m.sessionId);
+        if (arr) arr.push(m);
+        else bySession.set(m.sessionId, [m]);
+    }
+    if (bySession.size === 0) return;
+
+    const entries = Array.from(bySession.entries());
+    let idx = 0;
+    const step = () => {
+        if (idx >= entries.length) {
+            vaultRemove(VAULT_KEYS.LEGACY_CHAT_MESSAGES);
+            return;
+        }
+        const [sid, list] = entries[idx];
+        idx += 1;
+        writeSingleSessionMirror(sid, list);
+        setTimeout(step, 40);
+    };
+    setTimeout(step, 300);
 }
 
 export async function initChatDb(): Promise<{
@@ -254,24 +263,17 @@ export async function initChatDb(): Promise<{
                 chatDb.contacts.toArray(),
             ]);
             markMigrated();
-            try {
-                window.localStorage.removeItem(LS_MESSAGES_KEY);
-                window.localStorage.removeItem(LS_SESSIONS_KEY);
-                window.localStorage.removeItem(LS_CONTACTS_KEY);
-            } catch {}
+            clearLegacyLocalStorage();
+            backfillChatVaultIfMissing(messages, sessions, contacts);
             return { messages, sessions, contacts };
         }
 
-        const diskSessions = readChatDiskMirror<ChatSession>(LS_SESSIONS_KEY);
-        const diskContacts = readChatDiskMirror<ChatContact>(LS_CONTACTS_KEY);
+        const diskSessions = vaultReadJson<ChatSession[]>(VAULT_KEYS.CHAT_SESSIONS) ?? [];
+        const diskContacts = vaultReadJson<ChatContact[]>(VAULT_KEYS.CHAT_CONTACTS) ?? [];
         const diskMessages = readMessagesDiskMirror();
         if (diskSessions.length > 0 || diskContacts.length > 0 || diskMessages.length > 0) {
             markMigrated();
-            try {
-                window.localStorage.removeItem(LS_MESSAGES_KEY);
-                window.localStorage.removeItem(LS_SESSIONS_KEY);
-                window.localStorage.removeItem(LS_CONTACTS_KEY);
-            } catch {}
+            clearLegacyLocalStorage();
             if (diskMessages.length > 0) await chatDb.messages.bulkPut(diskMessages).catch(() => {});
             if (diskSessions.length > 0) await chatDb.sessions.bulkPut(diskSessions).catch(() => {});
             if (diskContacts.length > 0) await chatDb.contacts.bulkPut(diskContacts).catch(() => {});
@@ -291,10 +293,9 @@ export async function initChatDb(): Promise<{
             if (lsSessions.length > 0) await chatDb.sessions.bulkPut(lsSessions);
             if (lsContacts.length > 0) await chatDb.contacts.bulkPut(lsContacts);
 
-            window.localStorage.setItem(LS_MIGRATED_FLAG, "1");
-            window.localStorage.removeItem(LS_MESSAGES_KEY);
-            window.localStorage.removeItem(LS_SESSIONS_KEY);
-            window.localStorage.removeItem(LS_CONTACTS_KEY);
+            markMigrated();
+            clearLegacyLocalStorage();
+            backfillChatVaultIfMissing(lsMessages, lsSessions, lsContacts);
 
             return { messages: lsMessages, sessions: lsSessions, contacts: lsContacts };
         } catch (err) {
@@ -314,6 +315,16 @@ export async function initChatDb(): Promise<{
     return loaded;
 }
 
+function clearLegacyLocalStorage(): void {
+    try {
+        window.localStorage.removeItem(LS_MESSAGES_KEY);
+        window.localStorage.removeItem(LS_SESSIONS_KEY);
+        window.localStorage.removeItem(LS_CONTACTS_KEY);
+    } catch {
+        // ignore
+    }
+}
+
 function markMigrated(): void {
     try {
         window.localStorage.setItem(LS_MIGRATED_FLAG, "1");
@@ -328,7 +339,7 @@ async function loadFromIndexedDbWithRetries(): Promise<{
     contacts: ChatContact[];
 } | null> {
     let lastErr: unknown;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
         try {
             const [loadedMessages, loadedSessions, loadedContacts] = await Promise.all([
                 chatDb.messages.toArray(),
@@ -338,26 +349,26 @@ async function loadFromIndexedDbWithRetries(): Promise<{
             let messages = loadedMessages;
             let sessions = loadedSessions;
             let contacts = loadedContacts;
-            // 仅当整库为空（缓存被系统清空）时才从原生磁盘恢复，绝不复活用户日常主动删除的单条或单个会话
-            if (messages.length === 0 && sessions.length === 0) {
+
+            // 仅当整库全空（WebView 缓存被系统清除）时才从原生硬盘恢复，绝不复活主动删掉的会话或单条消息
+            if (messages.length === 0 && sessions.length === 0 && contacts.length === 0) {
                 const diskMessages = readMessagesDiskMirror();
+                const diskSessions = vaultReadJson<ChatSession[]>(VAULT_KEYS.CHAT_SESSIONS) ?? [];
+                const diskContacts = vaultReadJson<ChatContact[]>(VAULT_KEYS.CHAT_CONTACTS) ?? [];
                 if (diskMessages.length > 0) {
                     messages = diskMessages;
                     await chatDb.messages.bulkPut(diskMessages).catch(() => {});
                 }
-                const diskSessions = readChatDiskMirror<ChatSession>(LS_SESSIONS_KEY);
                 if (diskSessions.length > 0) {
                     sessions = diskSessions;
                     await chatDb.sessions.bulkPut(diskSessions).catch(() => {});
                 }
-                const diskContacts = readChatDiskMirror<ChatContact>(LS_CONTACTS_KEY);
                 if (diskContacts.length > 0) {
                     contacts = diskContacts;
                     await chatDb.contacts.bulkPut(diskContacts).catch(() => {});
                 }
             } else {
-                writeChatDiskMirror(LS_SESSIONS_KEY, sessions);
-                writeChatDiskMirror(LS_CONTACTS_KEY, contacts);
+                backfillChatVaultIfMissing(messages, sessions, contacts);
             }
             console.log(`[ChatDB] Loaded from IndexedDB: ${messages.length} messages, ${sessions.length} sessions, ${contacts.length} contacts`);
             return { messages, sessions, contacts };
@@ -365,8 +376,8 @@ async function loadFromIndexedDbWithRetries(): Promise<{
             lastErr = err;
             console.warn(`[ChatDB] Load attempt ${attempt + 1}/3 failed:`, err);
             if (attempt < 2) {
-                await new Promise(r => setTimeout(r, 300 * (attempt + 1)));
-                try { if (!chatDb.isOpen()) await chatDb.open(); } catch {}
+                await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+                try { if (!chatDb.isOpen()) await chatDb.open(); } catch { /* ignore */ }
             }
         }
     }
@@ -378,76 +389,118 @@ function safeParse<T>(raw: string | null): T[] {
     try { return raw ? JSON.parse(raw) : []; } catch { return []; }
 }
 
-// ── Async persistence helpers (fire-and-forget) ──
+// ── Async persistence helpers ──
 
 export function dbPutMessage(msg: ChatMessage): void {
-    chatDb.messages.put(msg).then(() => scheduleMessagesDiskMirror()).catch(err => console.warn("[ChatDB] put message failed:", err));
+    chatDb.messages.put(msg)
+        .then(() => { if (msg?.sessionId) scheduleSessionDiskMirror(msg.sessionId); })
+        .catch((err) => console.warn("[ChatDB] put message failed:", err));
 }
 
 export function dbPutMessages(msgs: ChatMessage[]): void {
-    chatDb.messages.bulkPut(msgs).then(() => scheduleMessagesDiskMirror()).catch(err => console.warn("[ChatDB] bulkPut messages failed:", err));
+    const sids = new Set<string>();
+    for (const m of msgs) {
+        if (m?.sessionId) sids.add(m.sessionId);
+    }
+    chatDb.messages.bulkPut(msgs)
+        .then(() => { for (const sid of sids) scheduleSessionDiskMirror(sid); })
+        .catch((err) => console.warn("[ChatDB] bulkPut messages failed:", err));
 }
 
 const DB_BULK_PUT_CHUNK = 2000;
 export async function dbBulkPutMessages(msgs: ChatMessage[]): Promise<void> {
     if (msgs.length === 0) return;
+    const sids = new Set<string>();
+    for (const m of msgs) {
+        if (m?.sessionId) sids.add(m.sessionId);
+    }
     for (let start = 0; start < msgs.length; start += DB_BULK_PUT_CHUNK) {
         await chatDb.messages.bulkPut(msgs.slice(start, start + DB_BULK_PUT_CHUNK));
     }
-    scheduleMessagesDiskMirror();
+    for (const sid of sids) scheduleSessionDiskMirror(sid);
 }
 
 export function dbDeleteMessage(id: string): void {
-    chatDb.messages.delete(id).then(() => scheduleMessagesDiskMirror()).catch(err => console.warn("[ChatDB] delete message failed:", err));
+    void (async () => {
+        try {
+            const existing = await chatDb.messages.get(id);
+            await chatDb.messages.delete(id);
+            if (existing?.sessionId) {
+                await flushSessionDiskMirrorNow(existing.sessionId);
+            }
+        } catch (err) {
+            console.warn("[ChatDB] delete message failed:", err);
+        }
+    })();
 }
 
 export function dbDeleteMessagesBySession(sessionId: string): void {
-    removeSessionDiskChunks(sessionId);
+    removeSessionDiskMirror(sessionId);
     chatDb.messages.where("sessionId").equals(sessionId).delete()
-        .then(() => scheduleMessagesDiskMirror())
-        .catch(err => console.warn("[ChatDB] delete session messages failed:", err));
+        .catch((err) => console.warn("[ChatDB] delete session messages failed:", err));
 }
 
 export function dbDeleteMessagesByIds(ids: string[]): void {
-    chatDb.messages.bulkDelete(ids).then(() => scheduleMessagesDiskMirror()).catch(err => console.warn("[ChatDB] bulkDelete messages failed:", err));
+    if (ids.length === 0) return;
+    void (async () => {
+        try {
+            const existing = await chatDb.messages.bulkGet(ids);
+            const sids = new Set<string>();
+            for (const m of existing) {
+                if (m?.sessionId) sids.add(m.sessionId);
+            }
+            await chatDb.messages.bulkDelete(ids);
+            for (const sid of sids) {
+                await flushSessionDiskMirrorNow(sid);
+            }
+        } catch (err) {
+            console.warn("[ChatDB] bulkDelete messages failed:", err);
+        }
+    })();
 }
 
 export function dbPutSession(session: ChatSession): void {
-    chatDb.sessions.put(session).then(() => chatDb.sessions.toArray().then(s => writeChatDiskMirror(LS_SESSIONS_KEY, s))).catch(err => console.warn("[ChatDB] put session failed:", err));
+    chatDb.sessions.put(session)
+        .then(() => syncAllSessionsListToVault())
+        .catch((err) => console.warn("[ChatDB] put session failed:", err));
 }
 
 export function dbPutSessions(sessions: ChatSession[]): void {
-    writeChatDiskMirror(LS_SESSIONS_KEY, sessions);
-    chatDb.sessions.bulkPut(sessions).catch(err => console.warn("[ChatDB] bulkPut sessions failed:", err));
+    chatDb.sessions.bulkPut(sessions)
+        .then(() => syncAllSessionsListToVault())
+        .catch((err) => console.warn("[ChatDB] bulkPut sessions failed:", err));
 }
 
 export function dbReplaceSessions(sessions: ChatSession[]): void {
-    writeChatDiskMirror(LS_SESSIONS_KEY, sessions);
+    vaultWriteJson(VAULT_KEYS.CHAT_SESSIONS, sessions);
     chatDb.transaction("rw", chatDb.sessions, async () => {
         await chatDb.sessions.clear();
         await chatDb.sessions.bulkPut(sessions);
-    }).catch(err => console.warn("[ChatDB] replace sessions failed:", err));
+    }).catch((err) => console.warn("[ChatDB] replace sessions failed:", err));
 }
 
 export function dbDeleteSession(id: string): void {
-    removeSessionDiskChunks(id);
-    chatDb.sessions.delete(id).then(() => chatDb.sessions.toArray().then(s => writeChatDiskMirror(LS_SESSIONS_KEY, s))).catch(err => console.warn("[ChatDB] delete session failed:", err));
+    removeSessionDiskMirror(id);
+    chatDb.sessions.delete(id)
+        .then(() => syncAllSessionsListToVault())
+        .catch((err) => console.warn("[ChatDB] delete session failed:", err));
 }
 
 export function dbPutContacts(contacts: ChatContact[]): void {
-    writeChatDiskMirror(LS_CONTACTS_KEY, contacts);
-    chatDb.contacts.bulkPut(contacts).catch(err => console.warn("[ChatDB] bulkPut contacts failed:", err));
+    chatDb.contacts.bulkPut(contacts)
+        .then(() => syncAllContactsListToVault())
+        .catch((err) => console.warn("[ChatDB] bulkPut contacts failed:", err));
 }
 
 export function dbClearContacts(): void {
-    writeChatDiskMirror(LS_CONTACTS_KEY, []);
-    chatDb.contacts.clear().catch(err => console.warn("[ChatDB] clear contacts failed:", err));
+    vaultWriteJson(VAULT_KEYS.CHAT_CONTACTS, []);
+    chatDb.contacts.clear().catch((err) => console.warn("[ChatDB] clear contacts failed:", err));
 }
 
 export function dbReplaceContacts(contacts: ChatContact[]): void {
-    writeChatDiskMirror(LS_CONTACTS_KEY, contacts);
+    vaultWriteJson(VAULT_KEYS.CHAT_CONTACTS, contacts);
     chatDb.transaction("rw", chatDb.contacts, async () => {
         await chatDb.contacts.clear();
         await chatDb.contacts.bulkPut(contacts);
-    }).catch(err => console.warn("[ChatDB] replaceContacts failed:", err));
+    }).catch((err) => console.warn("[ChatDB] replaceContacts failed:", err));
 }

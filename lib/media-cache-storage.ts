@@ -1,5 +1,13 @@
 import Dexie from "dexie";
 import { loadPhotoWallState } from "./photo-wall-storage";
+import {
+    VAULT_KEYS,
+    hasNativeVault,
+    vaultHasKey,
+    vaultReadJson,
+    vaultRemove,
+    vaultWriteJson,
+} from "./native-vault";
 
 // ── Database ─────────────────────────────────────
 
@@ -31,21 +39,20 @@ function getDb(): MediaCacheDatabase {
     return db;
 }
 
-// ── Android 原生 filesDir 永久磁盘媒体镜像（防止 WebView 清理缓存丢失聊天照片、照片墙与表情）──
+// ── Android 原生 filesDir 永久磁盘媒体镜像（自动分片，不截断大图/动图/音视频）──
 
-type NativeVaultBridge = {
-    saveLocalDiskData?: (key: string, content: string) => boolean;
-    loadLocalDiskData?: (key: string) => string;
-    removeLocalDiskData?: (key: string) => boolean;
+type SerializedDiskMedia = {
+    id?: string;
+    b64?: string;
+    mimeType?: string;
+    mediaCategory?: MediaCacheEntry["mediaCategory"];
+    createdAt?: number;
+    retainedBy?: string[];
 };
 
-function getNativeVaultBridge(): NativeVaultBridge | null {
-    if (typeof window === "undefined") return null;
-    const w = window as unknown as { AndroidShell?: NativeVaultBridge };
-    return w.AndroidShell ?? null;
+function mediaVaultKey(id: string): string {
+    return `${VAULT_KEYS.MEDIA_BLOB_PREFIX}${id}`;
 }
-
-const MAX_MEDIA_DISK_CHARS = 5_500_000;
 
 function blobToBase64String(blob: Blob): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -63,18 +70,15 @@ function blobToBase64String(blob: Blob): Promise<string> {
 function base64ToBlob(b64: string, mimeType: string): Blob {
     const binary = atob(b64);
     const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
     return new Blob([bytes], { type: mimeType || "application/octet-stream" });
 }
 
-async function writeMediaEntryToDisk(entry: MediaCacheEntry): Promise<void> {
-    if (typeof window === "undefined" || !entry?.id || !entry?.blob) return;
-    if (entry.blob.size > 4_000_000) return;
+export async function writeMediaEntryToDisk(entry: MediaCacheEntry): Promise<void> {
+    if (typeof window === "undefined" || !entry?.id || !entry?.blob || !hasNativeVault()) return;
     try {
-        const bridge = getNativeVaultBridge();
-        if (!bridge || typeof bridge.saveLocalDiskData !== "function") return;
         const b64 = await blobToBase64String(entry.blob);
-        const payload = JSON.stringify({
+        vaultWriteJson(mediaVaultKey(entry.id), {
             id: entry.id,
             b64,
             mimeType: entry.mimeType,
@@ -82,27 +86,15 @@ async function writeMediaEntryToDisk(entry: MediaCacheEntry): Promise<void> {
             createdAt: entry.createdAt,
             retainedBy: entry.retainedBy,
         });
-        if (payload.length <= MAX_MEDIA_DISK_CHARS) {
-            bridge.saveLocalDiskData("media_blob_" + entry.id, payload);
-        }
-    } catch {}
+    } catch {
+        // ignore
+    }
 }
 
 function readMediaEntryFromDisk(id: string): MediaCacheEntry | null {
-    if (typeof window === "undefined" || !id) return null;
+    if (typeof window === "undefined" || !id || !hasNativeVault()) return null;
     try {
-        const bridge = getNativeVaultBridge();
-        if (!bridge || typeof bridge.loadLocalDiskData !== "function") return null;
-        const raw = bridge.loadLocalDiskData("media_blob_" + id);
-        if (!raw || raw.trim().length < 10) return null;
-        const parsed = JSON.parse(raw) as {
-            id?: string;
-            b64?: string;
-            mimeType?: string;
-            mediaCategory?: MediaCacheEntry["mediaCategory"];
-            createdAt?: number;
-            retainedBy?: string[];
-        };
+        const parsed = vaultReadJson<SerializedDiskMedia>(mediaVaultKey(id));
         if (!parsed || typeof parsed.b64 !== "string" || !parsed.b64) return null;
         const mimeType = parsed.mimeType || "image/png";
         const blob = base64ToBlob(parsed.b64, mimeType);
@@ -121,12 +113,7 @@ function readMediaEntryFromDisk(id: string): MediaCacheEntry | null {
 
 function removeMediaEntryFromDisk(id: string): void {
     if (typeof window === "undefined" || !id) return;
-    try {
-        const bridge = getNativeVaultBridge();
-        if (bridge && typeof bridge.removeLocalDiskData === "function") {
-            bridge.removeLocalDiskData("media_blob_" + id);
-        }
-    } catch {}
+    vaultRemove(mediaVaultKey(id));
 }
 
 // ── MIME Sniffing ────────────────────────────────
@@ -202,7 +189,7 @@ export async function storeMediaBase64(b64: string, declaredMime?: string): Prom
     const { mime, category } = detectMediaType(b64, declaredMime);
     const binary = atob(b64);
     const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
     const blob = new Blob([bytes], { type: mime });
     const ref = await storeMediaBlob(blob, mime, category);
     return { ref, category, mime };
@@ -212,7 +199,10 @@ export async function loadMediaBlob(ref: string): Promise<{ blob: Blob; mimeType
     const id = ref.startsWith(MEDIA_STORE_PROTOCOL) ? ref.slice(MEDIA_STORE_PROTOCOL.length) : ref;
     const entry = await getDb().entries.get(id);
     if (entry) {
-        void writeMediaEntryToDisk(entry);
+        // 仅当原生硬盘中尚未存过这张历史媒体时补写一次，绝不在每次读图时重复编码写盘
+        if (hasNativeVault() && !vaultHasKey(mediaVaultKey(id))) {
+            void writeMediaEntryToDisk(entry);
+        }
         return { blob: entry.blob, mimeType: entry.mimeType, category: entry.mediaCategory };
     }
     const diskEntry = readMediaEntryFromDisk(id);
@@ -249,7 +239,7 @@ export async function releaseMediaRef(ref: string | undefined, owner: string): P
     const id = ref.slice(MEDIA_STORE_PROTOCOL.length);
     const entry = await table.get(id);
     if (!entry) return;
-    const retainedBy = (entry.retainedBy ?? []).filter(value => value !== owner.trim());
+    const retainedBy = (entry.retainedBy ?? []).filter((value) => value !== owner.trim());
     await table.update(id, { retainedBy });
     void writeMediaEntryToDisk({ ...entry, retainedBy });
 }
@@ -268,7 +258,7 @@ export async function deleteMediaRef(ref: string | undefined): Promise<void> {
     let referencedByPhotoWall = false;
     try {
         const state = loadPhotoWallState();
-        referencedByPhotoWall = state.wallBackgroundRef === ref || state.photos.some(photo => photo.mediaRef === ref);
+        referencedByPhotoWall = state.wallBackgroundRef === ref || state.photos.some((photo) => photo.mediaRef === ref);
     } catch { /* ignore */ }
     if (entry?.retainedBy?.length || referencedByPhotoWall) return;
     removeMediaEntryFromDisk(id);

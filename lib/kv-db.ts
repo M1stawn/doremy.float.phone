@@ -3,6 +3,14 @@
 // Replaces all localStorage usage to avoid the ~5-10MB quota limit.
 
 import Dexie from "dexie";
+import {
+    hasNativeVault,
+    vaultHasKey,
+    vaultListLogicalKeys,
+    vaultReadString,
+    vaultRemove,
+    vaultWriteString,
+} from "./native-vault";
 
 class KvDatabase extends Dexie {
     entries!: Dexie.Table<{ key: string; value: string }, string>;
@@ -45,6 +53,7 @@ function migrateLegacyKey(lsKey: string): void {
     if (raw === null) return;
     if (_cache.get(lsKey) !== raw) {
         _cache.set(lsKey, raw);
+        vaultWriteString(lsKey, raw);
         kvDb.entries.put({ key: lsKey, value: raw }).catch(() => {});
     }
     localStorage.removeItem(lsKey);
@@ -53,7 +62,7 @@ function migrateLegacyKey(lsKey: string): void {
 function migrateLegacyPrefix(prefix: string): void {
     if (typeof window === "undefined") return;
     const matched: string[] = [];
-    for (let i = 0; i < localStorage.length; i++) {
+    for (let i = 0; i < localStorage.length; i += 1) {
         const k = localStorage.key(i);
         if (k && k.startsWith(prefix)) matched.push(k);
     }
@@ -61,7 +70,7 @@ function migrateLegacyPrefix(prefix: string): void {
 }
 
 function matchesDynamicPrefix(key: string): boolean {
-    return _dynamicPrefixes.some(prefix => key.startsWith(prefix));
+    return _dynamicPrefixes.some((prefix) => key.startsWith(prefix));
 }
 
 function isManagedLegacyKey(key: string): boolean {
@@ -89,21 +98,6 @@ function removeLegacyLocalStorageKeyIfValue(key: string, value: string): void {
 // localStorage 配额只有 ~5MB,超过这个量级的 value(如自定义APP的整批
 // 音频/封面 dataURL)镜像必失败,setItem 前还得整份拷贝一次内存——直接跳过。
 const LOCAL_STORAGE_MIRROR_MAX_LENGTH = 400_000;
-// ── Android 原生 filesDir 永久磁盘镜像（防止 WebView 清理或未水合空写覆盖）──
-const NATIVE_DISK_MAX_LENGTH = 6_000_000;
-
-type NativeVaultBridge = {
-    saveLocalDiskData?: (key: string, content: string) => boolean;
-    loadLocalDiskData?: (key: string) => string;
-    removeLocalDiskData?: (key: string) => boolean;
-    listLocalDiskKeys?: () => string;
-};
-
-function getNativeVaultBridge(): NativeVaultBridge | null {
-    if (typeof window === "undefined") return null;
-    const w = window as unknown as { AndroidShell?: NativeVaultBridge };
-    return w.AndroidShell ?? null;
-}
 
 function isEffectivelyEmptyValue(raw: string | undefined | null): boolean {
     if (!raw) return true;
@@ -112,45 +106,11 @@ function isEffectivelyEmptyValue(raw: string | undefined | null): boolean {
 }
 
 function writeNativeDiskMirror(key: string, value: string): void {
-    if (typeof window === "undefined" || value.length > NATIVE_DISK_MAX_LENGTH) return;
-    try {
-        const bridge = getNativeVaultBridge();
-        if (bridge && typeof bridge.saveLocalDiskData === "function") {
-            // 防止未水合时的空数组/空对象覆盖原生硬盘里已有的完整数据
-            if (!_hydrated && isEffectivelyEmptyValue(value)) return;
-            bridge.saveLocalDiskData(key, value);
-        }
-    } catch {
-        // Ignore native bridge errors
-    }
+    if (typeof window === "undefined" || !hasNativeVault()) return;
+    // 防止未水合时的空数组/空对象覆盖原生硬盘里已有的完整数据
+    if (!_hydrated && isEffectivelyEmptyValue(value)) return;
+    vaultWriteString(key, value);
 }
-
-function readNativeDiskMirror(key: string): string | null {
-    if (typeof window === "undefined") return null;
-    try {
-        const bridge = getNativeVaultBridge();
-        if (bridge && typeof bridge.loadLocalDiskData === "function") {
-            const res = bridge.loadLocalDiskData(key);
-            if (typeof res === "string" && res.length > 0) return res;
-        }
-    } catch {
-        // Ignore native bridge errors
-    }
-    return null;
-}
-
-function removeNativeDiskMirror(key: string): void {
-    if (typeof window === "undefined") return;
-    try {
-        const bridge = getNativeVaultBridge();
-        if (bridge && typeof bridge.removeLocalDiskData === "function") {
-            bridge.removeLocalDiskData(key);
-        }
-    } catch {
-        // Ignore
-    }
-}
-
 
 function writeFallbackLocalStorage(key: string, value: string): void {
     if (typeof window === "undefined" || !isManagedLegacyKey(key)) return;
@@ -173,10 +133,6 @@ function isAbortLikeError(err: unknown): boolean {
 }
 
 // ── Hydration (call once at app startup) ──
-// 语义与 chat-storage 对齐：成功才置 _hydrated，失败清掉在途 promise 允许下次重试。
-// 此前失败也置 _hydrated=true：IndexedDB 一次临时读不出来，缓存就是空的，kvGet
-// 全部返回 null，「读取失败」和「本来就没有」无法区分——下一次任何整包
-// 读改写（如线下记录追加）都会拿空数据把 IndexedDB 里的真实历史覆盖掉。
 export function hydrateKvDb(): Promise<void> {
     if (_hydrated || typeof window === "undefined") return Promise.resolve();
     if (_hydratePromise) return _hydratePromise;
@@ -203,7 +159,7 @@ export function hydrateKvDb(): Promise<void> {
         }
 
         // Dynamic prefix keys
-        for (let i = 0; i < localStorage.length; i++) {
+        for (let i = 0; i < localStorage.length; i += 1) {
             const k = localStorage.key(i);
             if (!k || !matchesDynamicPrefix(k)) continue;
             const raw = localStorage.getItem(k);
@@ -216,51 +172,40 @@ export function hydrateKvDb(): Promise<void> {
             }
         }
 
-        // 从安卓原生 filesDir 恢复意外丢失或被清空的核心键值与动态前缀键值，并将已有 IDB 数据同步落盘到原生磁盘
-        const allKeysToSync = new Set<string>(_fixedKeys);
-        for (const k of _cache.keys()) allKeysToSync.add(k);
-        try {
-            const bridge = getNativeVaultBridge();
-            if (bridge && typeof bridge.listLocalDiskKeys === "function") {
-                const rawList = bridge.listLocalDiskKeys();
-                if (rawList) {
-                    const parsedKeys = JSON.parse(rawList);
-                    if (Array.isArray(parsedKeys)) {
-                        for (const dk of parsedKeys) {
-                            if (typeof dk === "string" && (_fixedKeys.includes(dk) || matchesDynamicPrefix(dk))) {
-                                allKeysToSync.add(dk);
-                            }
-                        }
+        if (hasNativeVault()) {
+            // 仅在 IndexedDB 与 localStorage 均为空（缓存被系统清空）时才从原生硬盘整库灾备恢复，
+            // 绝不把用户日常主动删除的单个键从原生盘复活回来。
+            if (_cache.size === 0) {
+                const candidateKeys = new Set<string>(_fixedKeys);
+                for (const dk of vaultListLogicalKeys()) {
+                    if (_fixedKeys.includes(dk) || matchesDynamicPrefix(dk)) {
+                        candidateKeys.add(dk);
                     }
                 }
-            }
-        } catch {}
-        for (const lsKey of allKeysToSync) {
-            const cur = _cache.get(lsKey);
-            if (cur === undefined) {
-                const diskVal = readNativeDiskMirror(lsKey);
-                if (diskVal && !isEffectivelyEmptyValue(diskVal)) {
-                    _cache.set(lsKey, diskVal);
-                    batch.push({ key: lsKey, value: diskVal });
+                for (const k of candidateKeys) {
+                    const diskVal = vaultReadString(k);
+                    if (diskVal && !isEffectivelyEmptyValue(diskVal)) {
+                        _cache.set(k, diskVal);
+                        batch.push({ key: k, value: diskVal });
+                    }
                 }
-            } else if (cur) {
-                writeNativeDiskMirror(lsKey, cur);
+            } else {
+                // 已有有效数据时，仅为原生盘中尚未镜像的键补写一次（避免每次冷启动全量重刷）
+                for (const [k, v] of _cache.entries()) {
+                    if (v && !vaultHasKey(k)) {
+                        vaultWriteString(k, v);
+                    }
+                }
             }
         }
 
         if (batch.length > 0) await kvDb.entries.bulkPut(batch);
         for (const k of removeKeys) localStorage.removeItem(k);
-        try {
-            if (_cache.size > 0) {
-                localStorage.setItem("ai_phone_idb_migrated_v1", "1");
-                localStorage.setItem("ai_phone_settings_idb_migrated_v1", "1");
-            }
-        } catch {}
     })().then(() => {
         _hydrated = true;
         _hydrateError = null;
         _hydratePromise = null;
-    }).catch(err => {
+    }).catch((err) => {
         // 不向上抛：既有调用方大多不接 catch。失败状态通过 isKvHydrated() /
         // getKvHydrationError() 暴露，入口（MainApp）负责拦住用户并提供重试。
         console.warn("[KvDB] hydration failed, will retry on next call:", err);
@@ -285,18 +230,21 @@ export function isKvHydrated(): boolean {
 export function kvGet(key: string): string | null {
     const cached = _cache.get(key);
     if (cached !== undefined) return cached;
-    const diskVal = readNativeDiskMirror(key);
-    if (diskVal !== null) {
-        _cache.set(key, diskVal);
-        return diskVal;
+    // 水合完成后严格只认内存缓存，绝不绕过水合去原生硬盘捞已删除的旧值
+    if (!_hydrated && hasNativeVault()) {
+        const diskVal = vaultReadString(key);
+        if (diskVal !== null) {
+            _cache.set(key, diskVal);
+            return diskVal;
+        }
     }
     return null;
 }
 
 // ── Write: update cache + fire-and-forget to IDB ──
 export function kvSet(key: string, value: string): void {
-    if (!_hydrated && isEffectivelyEmptyValue(value)) {
-        const existingDisk = readNativeDiskMirror(key);
+    if (!_hydrated && isEffectivelyEmptyValue(value) && hasNativeVault()) {
+        const existingDisk = vaultReadString(key);
         if (existingDisk && !isEffectivelyEmptyValue(existingDisk)) {
             _cache.set(key, existingDisk);
             return;
@@ -307,7 +255,7 @@ export function kvSet(key: string, value: string): void {
     if (isManagedLegacyKey(key)) writeFallbackLocalStorage(key, value);
     kvDb.entries.put({ key, value }).then(() => {
         if (isManagedLegacyKey(key)) removeLegacyLocalStorageKeyIfValue(key, value);
-    }).catch(err => {
+    }).catch((err) => {
         writeFallbackLocalStorage(key, value);
         if (!isAbortLikeError(err)) {
             console.warn("[KvDB] put failed:", key, err);
@@ -334,9 +282,9 @@ export async function kvSetAsync(key: string, value: string): Promise<void> {
 // ── Delete ──
 export function kvRemove(key: string): void {
     _cache.delete(key);
-    removeNativeDiskMirror(key);
+    vaultRemove(key);
     if (isManagedLegacyKey(key)) removeLegacyLocalStorageKey(key);
-    kvDb.entries.delete(key).catch(err =>
+    kvDb.entries.delete(key).catch((err) =>
         console.warn("[KvDB] delete failed:", key, err));
 }
 

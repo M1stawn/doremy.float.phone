@@ -2,6 +2,14 @@ import { DEFAULT_THEME_PROFILE, normalizeThemeProfile, type ThemeAssetType, type
 import { kvGet, kvSet, kvRemove, registerKvMigration } from "./kv-db";
 import { openIndexedDbAtLeast } from "./idb-open";
 import { themePresetUsesAsset } from "./theme-preset-storage";
+import {
+  VAULT_KEYS,
+  hasNativeVault,
+  vaultHasKey,
+  vaultReadJson,
+  vaultRemove,
+  vaultWriteJson,
+} from "./native-vault";
 
 export const THEME_PROFILE_STORAGE_KEY = "ai_phone_theme_profile_v1";
 registerKvMigration(THEME_PROFILE_STORAGE_KEY);
@@ -83,8 +91,6 @@ async function openThemeDb(): Promise<IDBDatabase | null> {
     return null;
   }
 
-  // Open at >= THEME_DB_VERSION: a backup restore may have bumped the stored
-  // version higher, and opening at a fixed lower version would throw a VersionError.
   return openIndexedDbAtLeast(THEME_DB_NAME, THEME_DB_VERSION, (database) => {
     if (!database.objectStoreNames.contains(THEME_ASSET_STORE)) {
       database.createObjectStore(THEME_ASSET_STORE, { keyPath: "id" });
@@ -189,8 +195,6 @@ async function normalizeIncomingBlob(blob: Blob): Promise<Blob> {
     return blob;
   }
   if (mime === "image/gif") {
-    // GIF 必须原样保留：canvas 只能取到第一帧，重编码等于把动图拍平成静态图。
-    // 代价是无法压缩，所以改为体积超限时报错，交给调用方提示用户。
     if (blob.size > ANIMATED_ASSET_MAX_BYTES) {
       throw new AnimatedAssetTooLargeError();
     }
@@ -207,59 +211,29 @@ function createThemeAssetId(type: ThemeAssetType): string {
   return `${type}_${uuid}`;
 }
 
+// ── Android 原生 filesDir 永久磁盘镜像（支持中文字体与高清壁纸自动分片落盘）──
 
-// ── Android 原生 filesDir 永久磁盘镜像（防止 WebView 清理缓存导致自定义字体、壁纸、素材丢失）──
-type NativeVaultBridge = {
-  saveLocalDiskData?: (key: string, content: string) => boolean;
-  loadLocalDiskData?: (key: string) => string;
-  removeLocalDiskData?: (key: string) => boolean;
-};
-
-function getNativeVaultBridge(): NativeVaultBridge | null {
-  if (typeof window === "undefined") return null;
-  const w = window as unknown as { AndroidShell?: NativeVaultBridge };
-  return w.AndroidShell ?? null;
+function themeVaultKey(id: string): string {
+  return `${VAULT_KEYS.THEME_ASSET_PREFIX}${id}`;
 }
 
 function writeAssetDiskMirror(record: ThemeAssetRecord): void {
-  if (typeof window === "undefined" || !record?.id || !record?.dataUrl) return;
-  try {
-    const bridge = getNativeVaultBridge();
-    if (bridge && typeof bridge.saveLocalDiskData === "function") {
-      const raw = JSON.stringify(record);
-      // 字体/高清壁纸可能较大，只要在 6MB 限制内均落盘原生硬盘
-      if (raw.length <= 6_000_000) {
-        bridge.saveLocalDiskData("theme_asset_" + record.id, raw);
-      }
-    }
-  } catch {}
+  if (typeof window === "undefined" || !record?.id || !record?.dataUrl || !hasNativeVault()) return;
+  vaultWriteJson(themeVaultKey(record.id), record);
 }
 
 function readAssetDiskMirror(id: string): ThemeAssetRecord | null {
-  if (typeof window === "undefined" || !id) return null;
-  try {
-    const bridge = getNativeVaultBridge();
-    if (bridge && typeof bridge.loadLocalDiskData === "function") {
-      const raw = bridge.loadLocalDiskData("theme_asset_" + id);
-      if (raw && raw.trim().length > 10) {
-        const parsed = JSON.parse(raw);
-        if (parsed && parsed.id === id && parsed.dataUrl) {
-          return parsed as ThemeAssetRecord;
-        }
-      }
-    }
-  } catch {}
+  if (typeof window === "undefined" || !id || !hasNativeVault()) return null;
+  const parsed = vaultReadJson<ThemeAssetRecord>(themeVaultKey(id));
+  if (parsed && parsed.id === id && parsed.dataUrl) {
+    return parsed;
+  }
   return null;
 }
 
 function removeAssetDiskMirror(id: string): void {
   if (typeof window === "undefined" || !id) return;
-  try {
-    const bridge = getNativeVaultBridge();
-    if (bridge && typeof bridge.removeLocalDiskData === "function") {
-      bridge.removeLocalDiskData("theme_asset_" + id);
-    }
-  } catch {}
+  vaultRemove(themeVaultKey(id));
 }
 
 async function saveAssetRecord(record: ThemeAssetRecord): Promise<void> {
@@ -289,10 +263,15 @@ async function readAssetRecord(id: string): Promise<ThemeAssetRecord | null> {
       await runTransactionDone(transaction);
       if (result) {
         const rec = result as ThemeAssetRecord;
-        writeAssetDiskMirror(rec);
+        // 仅在原生硬盘尚无此历史资源时补写一次，避免每次渲染壁纸/字体重复刷盘
+        if (hasNativeVault() && !vaultHasKey(themeVaultKey(rec.id))) {
+          writeAssetDiskMirror(rec);
+        }
         return rec;
       }
-    } catch {} finally {
+    } catch {
+      // fall through to native disk vault
+    } finally {
       database.close();
     }
   }
@@ -348,12 +327,12 @@ export async function writeThemeAssetRecords(records: ThemeAssetRecord[]): Promi
 }
 
 export async function deleteThemeAsset(id: string): Promise<void> {
-  removeAssetDiskMirror(id);
-  // 本地主题预设只保存资源引用；只要仍有预设使用该资源，就不能物理删除，
+  // 本地主题预设只保存资源引用；只要仍有预设使用该资源，就不能物理删除（包括原生盘镜像），
   // 否则用户切回预设时会出现壁纸、图标或字体丢失。
   if (themePresetUsesAsset(id)) {
     return;
   }
+  removeAssetDiskMirror(id);
   const database = await openThemeDb();
   if (!database) {
     return;

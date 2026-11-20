@@ -21,6 +21,7 @@ import {
   type MediaResolver,
 } from "./serializers";
 import { kvEntries, kvGet, kvRemove, kvSetAsync } from "../kv-db";
+import { VAULT_KEYS, hasNativeVault, vaultPurgeDatabase, vaultWriteJson } from "../native-vault";
 
 type SourceStats = {
   records: number;
@@ -136,6 +137,47 @@ function tryReplaceEmptyJsonValue(existingRaw: string, incomingRaw: string): str
   return incomingRaw;
 }
 
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => {
+      const res = String(reader.result ?? "");
+      const comma = res.indexOf(",");
+      resolve(comma >= 0 ? res.slice(comma + 1) : res);
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
+/** 备份导入时同步将媒体/主题二进制记录落盘到原生硬盘，避免尚未浏览前 WebView 清缓存丢失。 */
+async function mirrorImportedRecordToVault(dbName: string, storeName: string, value: unknown): Promise<void> {
+  if (!hasNativeVault() || !isRecord(value)) return;
+  try {
+    if (dbName === "AiPhoneMediaCacheDB" && storeName === "entries") {
+      if (typeof value.id === "string" && value.blob instanceof Blob) {
+        const b64 = await blobToBase64(value.blob);
+        vaultWriteJson(`${VAULT_KEYS.MEDIA_BLOB_PREFIX}${value.id}`, {
+          id: value.id,
+          b64,
+          mimeType: typeof value.mimeType === "string" ? value.mimeType : value.blob.type || "image/png",
+          mediaCategory: typeof value.mediaCategory === "string" ? value.mediaCategory : "image",
+          createdAt: typeof value.createdAt === "number" ? value.createdAt : Date.now(),
+          retainedBy: Array.isArray(value.retainedBy) ? value.retainedBy : undefined,
+        });
+      }
+      return;
+    }
+    if (dbName === "ai_phone_theme_db_v1" && storeName === "assets") {
+      if (typeof value.id === "string" && typeof value.dataUrl === "string" && value.dataUrl) {
+        vaultWriteJson(`${VAULT_KEYS.THEME_ASSET_PREFIX}${value.id}`, value);
+      }
+    }
+  } catch {
+    // ignore native mirror error during import
+  }
+}
+
 // Delete a whole IndexedDB database (used to clean up orphaned legacy DBs).
 // Resolves regardless of outcome; never throws.
 export function deleteDatabase(dbName: string): Promise<void> {
@@ -162,7 +204,6 @@ async function openDb(
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     const settle = (db: IDBDatabase | null) => {
       if (settled) {
-        // 超时放弃之后连接才姗姗来迟：没人用了，关掉防泄漏。
         db?.close();
         return;
       }
@@ -171,17 +212,12 @@ async function openDb(
       if (deadlineTimer) clearTimeout(deadlineTimer);
       resolve(db);
     };
-    // 排在一个被 blocked 的升级请求后面的 open 不会收到任何事件，只会无限挂起，
-    // 需要总体超时兜底（IDBOpenDBRequest 无法取消，迟到的连接由 settle 关闭）。
     if (opts.deadlineMs && opts.deadlineMs > 0) {
       deadlineTimer = setTimeout(() => settle(null), opts.deadlineMs);
     }
     request.onupgradeneeded = () => upgrade?.(request.result, request.transaction);
     request.onsuccess = () => settle(request.result);
     request.onerror = () => settle(null);
-    // blocked ≠ 失败：持有旧连接的页面随时可能松手（Dexie 等库收到 versionchange
-    // 会自动关闭），之后 success 照常触发。立刻放弃会让「应用自己开着库」这种
-    // 最常见的场景整库导入失败（恢复内容不全），所以给一个宽限窗口，等不到再放弃。
     request.onblocked = () => {
       const grace = opts.blockedGraceMs ?? 0;
       if (grace <= 0) return settle(null);
@@ -231,11 +267,6 @@ function recordTimeMs(value: Record<string, unknown>): number | null {
 
 type ImageRangeResult = { skip: boolean; value: unknown };
 
-/**
- * Build a backup-only copy with old dynamic images removed.
- * Text, messages, posts and comments remain intact; the live IndexedDB record is never mutated.
- * Avatars and desktop/theme assets live in other sources and deliberately bypass this filter.
- */
 function filterOldDynamicImages(
   dbName: string,
   storeName: string,
@@ -290,9 +321,6 @@ async function exportIndexedDbSource(
 ): Promise<IndexedDbSourceBackup> {
   const db = await openDb(source.dbName);
   if (!db) {
-    // 打不开 ≠ 没数据：无版本 open 对不存在的库会新建空库并成功返回，
-    // 走到这里说明是真报错（被浏览器清除中/损坏/被占用）。必须带出错误，
-    // 否则会打出一个"看起来成功、实际缺整库"的备份（用户实报踩坑）。
     return { type: "indexeddb", dbName: source.dbName, stores: [], error: `无法打开数据库 ${source.dbName}（可能已被浏览器清除或损坏）` };
   }
 
@@ -303,8 +331,6 @@ async function exportIndexedDbSource(
     for (const storeName of storeNames) {
       const transaction = db.transaction(storeName, "readonly");
       const store = transaction.objectStore(storeName);
-      // Capture index definitions synchronously — store.index() throws once the
-      // transaction has finished (it auto-commits after the cursor drains).
       const indexes = Array.from(store.indexNames).map((indexName) => {
         const index = store.index(indexName);
         return {
@@ -331,9 +357,6 @@ async function exportIndexedDbSource(
         request.onerror = () => reject(request.error);
       });
 
-      // 逐条序列化，并立刻松开原始记录的引用。游标必须先排空（IDB 事务里不能 await），
-      // 但排空之后没理由让原始值和序列化结果两份同时活着——大库导出时这份多余的拷贝
-      // 就是压垮移动端的最后一根稻草。原地置空，顺序不变，边走边还内存。
       for (let index = 0; index < rawRecords.length; index += 1) {
         const record = rawRecords[index];
         rawRecords[index] = undefined as unknown as StoreRecordBackup;
@@ -361,16 +384,12 @@ async function exportIndexedDbSource(
 }
 
 async function readKvRecords(source: KvSource): Promise<{ key: string; value: string }[]> {
-  // 读不到真实存储时必须失败，绝不静默退回内存缓存：KV 水合失败时缓存可能是
-  // 空的/不完整的，退回缓存会生成一份「导出成功」但缺数据的备份——用户换设备
-  // 导入后才发现历史没了。宁可备份报错，也不产出表面正常的残缺 ZIP。
   const byKey = new Map<string, { key: string; value: string }>();
   const db = await openDb("AiPhoneKvDB");
   if (!db) {
     throw new Error("本机数据库（AiPhoneKvDB）打不开，为避免生成不完整的备份已中止。请重启浏览器后重试。");
   }
   try {
-    // 库刚建、还没有 entries 表 = 这台设备确实没写过 KV 数据，不算读取失败
     if (Array.from(db.objectStoreNames).includes("entries")) {
       const transaction = db.transaction("entries", "readonly");
       const request = transaction.objectStore("entries").openCursor();
@@ -393,7 +412,6 @@ async function readKvRecords(source: KvSource): Promise<{ key: string; value: st
     db.close();
   }
 
-  // 内存缓存并入时防止未水合的空数组/空对象反杀 IndexedDB 里的完整历史记录
   const isEffectivelyEmptyExportValue = (val: string) => {
     const t = val.trim();
     return t === "" || t === "[]" || t === "{}" || t === "null";
@@ -515,33 +533,22 @@ type StoreSpec = {
   indexes?: StoreIndexBackup[];
 };
 
-// Recreate the indexes the backup declared (e.g. Dexie's bookId / compound indexes)
-// on a store. Without them, indexed queries throw SchemaError after restoring into
-// a browser where the owning app never created the schema itself.
 function applySpecIndexes(store: IDBObjectStore, spec: StoreSpec): void {
   for (const idx of spec.indexes ?? []) {
     if (store.indexNames.contains(idx.name)) continue;
     try {
       store.createIndex(idx.name, idx.keyPath, { unique: idx.unique, multiEntry: idx.multiEntry });
     } catch {
-      // An incompatible existing schema shouldn't abort the record restore.
+      // ignore
     }
   }
 }
 
-// Create every needed object store for a DB in a SINGLE version bump. Bumping the
-// version once per store (the old behaviour) pushed a freshly-restored DB far above
-// the version the app opens it at (e.g. reading-db's 5 stores → v6 vs the app's v3),
-// which then failed with "lower version than existing". One bump caps the gap at +1
-// so the app's own open just upgrades over it.
 async function ensureStores(dbName: string, specs: StoreSpec[]): Promise<IDBDatabase | null> {
   let db = await openDb(dbName);
   if (!db) return null;
   const existing = new Set(Array.from(db.objectStoreNames));
   const missing = specs.filter((s) => !existing.has(s.name));
-  // Only repair the memory store when its indexes are actually missing.
-  // Always bumping the DB version can be blocked by a live memory-page
-  // connection, which makes restore skip the real memory records.
   let knownIndexRepairNeeded = false;
   if (dbName === MEMORY_DB_NAME && existing.has(MEMORY_STORE_NAME)) {
     try {
@@ -552,8 +559,6 @@ async function ensureStores(dbName: string, specs: StoreSpec[]): Promise<IDBData
     }
   }
 
-  // Existing stores that lack indexes the backup declares need an upgrade pass too
-  // (repairs DBs left index-less by restores made before indexes were backed up).
   let indexRepairNeeded = false;
   const presentWithIndexes = specs.filter((s) => existing.has(s.name) && (s.indexes?.length ?? 0) > 0);
   if (presentWithIndexes.length > 0) {
@@ -585,9 +590,6 @@ async function ensureStores(dbName: string, specs: StoreSpec[]): Promise<IDBData
       ensureKnownStoreIndexes(dbName, store);
     }
   }, { blockedGraceMs: 15_000 });
-  // 升级被占用/失败时退回无版本打开：能写进已存在的 store 就写，缺失的 store
-  // 由导入侧逐个上报。整库直接放弃（旧行为）= 用户看到「恢复完成」但整块数据没了。
-  // 这个回退 open 会排在仍然 blocked 的升级请求后面，必须带总体超时。
   if (!db) db = await openDb(dbName, undefined, undefined, { deadlineMs: 3_000 });
   return db;
 }
@@ -610,7 +612,6 @@ export async function importSource(
 
   if (payload.type === "localStorage") {
     for (const record of payload.records) {
-      // 单条失败（配额满、单条数据损坏）只损失这一条，剩下的照常导入。
       try {
         const exists = window.localStorage.getItem(record.key) !== null;
         if (exists && !overwrite) {
@@ -632,8 +633,6 @@ export async function importSource(
 
   if (payload.type === "kv") {
     for (const record of payload.records) {
-      // 逐条兜底：以前整个循环包在一个 try 里，第一条出错后剩余记录全部
-      // 静默丢弃——正是「恢复内容不全」的来源之一。
       try {
         const incoming = await deserializeStorageString(record.value, resolver);
         const existing = kvGet(record.key);
@@ -665,7 +664,6 @@ export async function importSource(
     return result;
   }
 
-  // Create every store the payload needs in ONE version bump, then write each.
   const db = await ensureStores(
     payload.dbName,
     payload.stores.map((s) => ({ name: s.name, keyPath: s.keyPath, autoIncrement: s.autoIncrement, indexes: s.indexes })),
@@ -674,11 +672,13 @@ export async function importSource(
     result.errors.push(`无法打开 ${payload.dbName}`);
     return result;
   }
+
+  // 对非按条直写镜像的集合库，导入成功后清掉旧原生盘镜像，重启水合时自动把最新完整库补镜进原生盘
+  const isPerRecordVaultDb = payload.dbName === "AiPhoneMediaCacheDB" || payload.dbName === "ai_phone_theme_db_v1";
+
   try {
     for (const storePayload of payload.stores) {
       if (!db.objectStoreNames.contains(storePayload.name)) {
-        // 升级被其它连接挡住又等不到 → 该 store 建不出来。一次性上报清楚，
-        // 而不是对每条记录抛一个 NotFoundError。
         result.errors.push(`${payload.dbName}.${storePayload.name}: 数据库被其它页面占用，无法创建该对象仓库，已跳过 ${storePayload.records.length} 条（请关闭其它标签页后重试）`);
         doneRecords += storePayload.records.length;
         onProgress?.(doneRecords, totalRecords);
@@ -706,6 +706,9 @@ export async function importSource(
             await runRequest(store.put(value));
           }
           await done;
+          if (isPerRecordVaultDb) {
+            await mirrorImportedRecordToVault(payload.dbName, storePayload.name, value);
+          }
           if (existing !== undefined) result.overwritten += 1;
           else result.added += 1;
         } catch (error) {
@@ -715,6 +718,9 @@ export async function importSource(
           tick();
         }
       }
+    }
+    if (!isPerRecordVaultDb && (result.added > 0 || result.overwritten > 0)) {
+      vaultPurgeDatabase(payload.dbName, payload.stores.map((s) => s.name));
     }
   } finally {
     db.close();
@@ -776,6 +782,8 @@ export async function clearSource(source: DataSource): Promise<ClearResult> {
       result.removed += count;
       await transactionDone(transaction);
     }
+    // 同步清空对应的原生硬盘镜像，防止数据管理主动清空后重启复活
+    vaultPurgeDatabase(source.dbName, storeNames);
   } catch (error) {
     result.errors.push(String(error));
   } finally {
